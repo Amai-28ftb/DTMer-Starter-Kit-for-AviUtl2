@@ -1,5 +1,8 @@
 # DTMer-Starter-Kit-for-AviUtl2
 
+### 紹介動画
+[!['【AviUtl2】DTMer Starter Kit for AviUtl2【音声波形とMIDI】']("https://external-content.duckduckgo.com/iu/?u=https%3A%2F%2Fi.ytimg.com%2Fvi%2F_GgLe4Q8b8Y%2Fmaxresdefault.jpg&f=1&nofb=1&ipt=72eb9ececa868996330078274e363d30f8eb93f152d4ae6a75cf97e875320db7")]("https://www.nicovideo.jp/watch/sm45949170")
+
 ### 確認事項
 私の配布してる Aviutl / Aviutl2 の Script に関しては、紹介動画さえ親登録してくれれば事前・事後報告無しで勝手にフォーク版作って貰って構わないので、誰か軽量化とか機能追加とかしてください。
 必須事項はニコニコ動画への投稿と、親登録です。クリ奨OKです。
