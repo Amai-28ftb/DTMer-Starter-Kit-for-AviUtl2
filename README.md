@@ -1,5 +1,5 @@
 ## 紹介動画
-https://www.nicovideo.jp/watch/sm45949170
+ニコニコ動画：https://www.nicovideo.jp/watch/sm45949170
 
 
 ## 確認事項
