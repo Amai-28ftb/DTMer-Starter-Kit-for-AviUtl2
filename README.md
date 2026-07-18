@@ -29,14 +29,14 @@ https://www.nicovideo.jp/watch/sm45949170
 - MIDI_Visualizer_2：MIDIを読み込み、ノーツを表示します。
 - MIDI_ChordTone：MIDIを読み込み、音階を表示します。
 - MIDI_ChordDetectionMIDIを読み込み、コードを自動判定し表示します。
-# @DTMer Starter Kit.anm2
+### @DTMer Starter Kit.anm2
 - BitterDance：FL Studio の Fruity Dance の様なものです。
-# @DTMer Starter Kit.tra2
+### @DTMer Starter Kit.tra2
 - SoundSync_Live：カスタムオブジェクト側で設定した情報からトラックバーの動きを音声同期させます。
 - SoundSync_Cumulative：カスタムオブジェクト側で設定した情報からトラックバーの動きを音声同期させます。
-# MIDI_for_AviUtl.lua
+### MIDI_for_AviUtl.lua
 - MIDI系スクリプト用です。MIDIを読み込み、ノーツデータを取得する用のファイルです。
-# chord_config.lua
+### chord_config.lua
 - コード判定用のデータです。判定するコード内容を追加・削除が可能です。
 
 
