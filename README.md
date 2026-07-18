@@ -2,14 +2,20 @@
 https://www.nicovideo.jp/watch/sm45949170
 
 
+## 配布先について
+- [Notion](https://app.notion.com/p/AviUtl-Script-178bea655f6480208a75fc94e60244ad)：一番更新が早いです
+- [BOOTH](https://amai-28ftb.booth.pm/items/7986564)：支援用です。無料DLも可能です。
+- [Github](https://github.com/Amai-28ftb/DTMer-Starter-Kit-for-AviUtl2)：ここです。
+
+
 ## 注意事項
 - 私の書いたコードが各方面から怒られるレベルであまりにも汚すぎたのと、冗長な処理が多すぎて動作がかなり重かったので、可読性を高める為&処理の簡略化の為、AIにリファクタを手伝って貰っています。使用前にご了承ください。
 - GitHub Copilotが提案するコードは著作権的にクリーンのはずですが、万が一問題がありましたら連絡ください。該当箇所を修正します。
 - 現在はβ版ですので、バグや不具合が多いと思いますがご了承ください。
 
 ## 使用方法
-- 詳細は以下の URL から Notion をご覧ください。
-- https://app.notion.com/p/DTMerStarterKit-Wiki-AviUtl2-300bea655f64804d975fea11976ad85c
+- カスタムオブジェクト、アニメーション効果、トラックバーから呼び出してください。
+- 詳細な説明は [Notion](https://app.notion.com/p/DTMerStarterKit-Wiki-AviUtl2-300bea655f64804d975fea11976ad85c) をご覧ください。
 
 ## 内容物
 ### @DTMer Starter Kit.obj2
