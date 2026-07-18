@@ -15,7 +15,7 @@ https://www.nicovideo.jp/watch/sm45949170
 
 ## 使用方法
 - カスタムオブジェクト、アニメーション効果、トラックバーから呼び出してください。
-- 詳細な説明は [Notion](https://app.notion.com/p/DTMerStarterKit-Wiki-AviUtl2-300bea655f64804d975fea11976ad85c) をご覧ください。
+- 詳細な説明は [Notion](https://tourmaline-rock-7c0.notion.site/DTMerStarterKit-Wiki-AviUtl2-300bea655f64804d975fea11976ad85c) をご覧ください。
 
 ## 内容物
 ### @DTMer Starter Kit.obj2
