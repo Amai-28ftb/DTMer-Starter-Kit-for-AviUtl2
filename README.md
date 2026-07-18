@@ -16,7 +16,7 @@ https://www.nicovideo.jp/watch/sm45949170
 - https://app.notion.com/p/DTMerStarterKit-Wiki-AviUtl2-300bea655f64804d975fea11976ad85c
 
 ## 内容物
-# @DTMer Starter Kit.obj2
+### @DTMer Starter Kit.obj2
 - AudioSpectrum_01：音声波形です。
 - AudioSpectrum_02：音声波形です。
 - AudioSpectrum_03：音声波形です。
