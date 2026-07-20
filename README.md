@@ -67,6 +67,7 @@
 ## 連絡先
 - [Twitter(現X)](https://x.com/Amai_28ftb)
 - [その他SNS](https://linktr.ee/amai_28ftb)
+- [contact](https://forms.gle/j9dP1Lz6hVX8uhpV9)
 - 『AviUtl2の情報が知りたいだろって!!』『抹茶鯖』『音声波形の部屋』にも加入していますので、そこから Discord の DM に連絡頂いても構いません。全ての通知を切って放置している為、鯖内でメンションされても気付きません。ご了承ください。
 
 
