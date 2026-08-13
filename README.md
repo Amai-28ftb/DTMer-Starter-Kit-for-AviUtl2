@@ -6,7 +6,7 @@
 ## 配布先について
 - [Notion](https://app.notion.com/p/AviUtl-Script-178bea655f6480208a75fc94e60244ad)：一番更新が早いです
 - [BOOTH](https://amai-28ftb.booth.pm/items/7986564)：支援用です。無料DLも可能です。
-- [Github](https://github.com/Amai-28ftb/DTMer-Starter-Kit-for-AviUtl2)：ここです。
+- [Github](https://github.com/Amai-28ftb/DTMer-Starter-Kit-for-AviUtl2)：多分ここです。
 
 
 ## 注意事項
