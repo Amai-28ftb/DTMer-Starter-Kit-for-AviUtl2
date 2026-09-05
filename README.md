@@ -31,20 +31,28 @@
 - StereoImager：音の広がりを可視化します。
 - PlayBar：オブジェクトの長さに応じて再生バーを表示します。
 - PlayTime：オブジェクトの長さに応じて再生時間を表示します。
-- TimeSignature：BPMと拍数を入力すると拍数が表示されます。
-- MIDI_Visualizer：MIDIを読み込み、ノーツを表示します。
-- MIDI_Visualizer_2：MIDIを読み込み、ノーツを表示します。
-- MIDI_ChordTone：MIDIを読み込み、音階を表示します。
-- MIDI_ChordDetectionMIDIを読み込み、コードを自動判定し表示します。
+- TimeSignature：BPMと拍数を入力すると拍数が表示されます。MIDI ファイルを読み込むと MIDI から拍子とBPMを取得します。
+- MIDI_Visualizer：MIDI を読み込み、ノーツを表示します。[AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main)の『@Easing Receptor』と連携があります。
+- MIDI_Visualizer_2：MIDI を読み込み、ノーツを表示します。[AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main)の『@Easing Receptor』と連携があります。
+- MIDI_ChordTone：MIDI を読み込み、音階を表示します。[AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main)の『@Easing Receptor』と連携があります。
+- MIDI_ChordDetection：MIDI を読み込み、コードを自動判定し表示します。[AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main)の『@Easing Receptor』と連携があります。
 ### @DTMer Starter Kit.anm2
 - BitterDance：FL Studio の Fruity Dance の様なものです。
+- MIDI_NoteSync：MIDIを読み込み、ノーツの位置にオブジェクトを描画します。[AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main)の『@Easing Receptor』と連携があります。
 ### @DTMer Starter Kit.tra2
 - SoundSync_Live：カスタムオブジェクト側で設定した情報からトラックバーの動きを音声同期させます。
 - SoundSync_Cumulative：カスタムオブジェクト側で設定した情報からトラックバーの動きを音声同期させます。
+- BPM_Sync：BPM 同期します。[AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main)の『@Easing Receptor』と連携があります。
+- MIDI_NoteTrigger：MIDI をトリガーにしてトラックバーの範囲で値が変化します。[AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main)の『@MIDI Receptor』が必須です。
+- MIDI_Sync(Low)：MIDI のノーツと同期します。[AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main)の『@MIDI Receptor』が必須です。
+- MIDI_Sync(High)：MIDI のノーツと同期します。[AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main)の『@MIDI Receptor』が必須です。
 ### MIDI_for_AviUtl.lua
 - MIDI系スクリプト用です。MIDIを読み込み、ノーツデータを取得する用のファイルです。
+- DTMer Starter Kit の MIDI系 Script を動作させるのに必須です。
+- [AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main)の『@MIDI Receptor』を動作させるのに必須です。
 ### chord_config.lua
 - コード判定用のデータです。判定するコード内容を追加・削除が可能です。
+- MIDI_ChordDetection の動作に必須です。
 
 
 ## 規約的な何か
@@ -85,7 +93,3 @@
 
 ## あとがき
 Pull Requestする場合はTwitterかDiscordのDMに一報頂ければ多分通します。
-
-修正予定
-- SoundSync系の表示バグ
-- VolumeMeterの表示バグ
