@@ -1,5 +1,6 @@
 ## 紹介動画
 動画を見ればどんなスクリプトか一発で分かります。基本的に音声波形、ステレオイメージャー、MIDI表示、音声同期がメインです。
+一部 [AUL Receptor](https://github.com/Amai-28ftb/AUL-Receptor/tree/main) が無いと動かない機能があります。
 [ニコニコ動画](https://www.nicovideo.jp/watch/sm45949170)
 
 
