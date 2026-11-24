@@ -1,0 +1,4064 @@
+--[[
+    この Script のバージョンは【β版】です。
+    最新版についてはDL先を参照してください。
+
+    これは AviUtl2 用の音声系スクリプトまとめです。
+    各スクリプトの説明は配布ページの Wiki を参照してください。
+    同サイトでDL可能な『DTMer Starter Kit.obj』は AviUtl 用の Script であり、 rikky_module に依存している為 AviUtl2 環境で動作しません。
+    そこで、 rikky_module に依存しない形で同等の機能を実装したのが本 script です。
+    その為、 rikky_module を使用した元の script と動作や機能が少し異なる部分があります。
+    
+    同梱の『MIDI_for_AviUtl.lua』 と 『ChordTone.lua』 はこの script と同じ階層に配置してください。
+    配置場所が異なると一部の機能が動作しません。
+
+    免責事項
+    ・本 Script のリファクタ作業を Github Copilot にお手伝いして頂いております。
+    基本的には提案を元に試行錯誤しておりますが、一部 Github Copilot の提案をそのまま使用している箇所もありますので、問題の箇所がありましたらご連絡ください。直ちに修正致します。
+    ・本 Script を使用したことにより発生したいかなる損害についても、作者は一切の責任を負いません。。
+]]
+
+
+@AudioSpectrum_01
+--[[
+    オーディオスペクトラムです。
+    デフォルトの音声波形を少し滑らかにした音声波形を描画します。
+    基本は obj.getaudio() で取得した波形データをガウシアンフィルタで滑らかにし、指定した分割数で間引いて描画しています。
+    細かな設定は local config のところをいじってください。
+    分割数を増やせば増やすだけ重くなります。減らすと軽くなるので、波形の滑らかさと相談してください。
+    また、ミラーは同じ波形をもう1本描画する為、更に重くなります。分割数が高い状態でミラーをONにするとかなり重くなるので注意してください。
+    こだわりが無ければ AviUtl2 標準のミラーを使うことをお勧めします。
+]] 
+--track@start_freq:最小範囲,0,1023,0,1
+--track@end_freq:最大範囲,1,1024,64,1
+--track@split_count:分割数,1,2048,128,1
+--track@draw_width:横幅,100,1920,1024,1
+--track@bar_width:線太さ,1,1024,5,1
+--track@bar_scale:波形高さ,1,16,4,0.1
+--check@flip_spectrum:上下反転,0
+--check@mirror_spectrum:ミラー,0
+--color@spectrum_color:色,0x02edaf
+
+-- 設定値
+local config = {
+    -- 定数
+    spectrum_scale       = 400000,                      -- 波形スケール
+    center_y             = 0,                           -- バー描画基点Y座標
+
+    -- 表示設定
+    start_freq           = start_freq,                   -- 周波数範囲（開始）
+    end_freq             = end_freq,                     -- 周波数範囲（終了）
+    split_count          = split_count,                  -- 周波数分割数
+    draw_width           = draw_width,                    -- 横幅
+    spectrum_color       = spectrum_color,              -- 波形の色
+    bar_width            = bar_width,                    -- バー太さ
+    bar_scale            = bar_scale,                    -- バー高さ倍率
+    flip_spectrum        = flip_spectrum,               -- 上下反転
+    mirror_spectrum      = mirror_spectrum,             -- ミラー表示
+    screen_height        = obj.screen_h,                -- 画面縦幅
+
+    -- 処理設定
+    sigma_value          = 2.5,                         -- シグマ値
+    noise_threshold      = 0.1,                         -- ノイズゲート閾値
+    kernel_size          = 9,                           -- カーネルサイズ（奇数推奨）
+    edge_padding         = 3,                           -- エッジパディング幅
+}
+
+-- ガウシアンカーネルのキャッシュ（再計算を避けるため）
+local kernel_cache = {}
+
+-- ガウシアンカーネルを生成（スムージング用）
+local function get_kernel(kernel_size, sigma_value)
+    local key = kernel_size .. "_" .. sigma_value
+    if kernel_cache[key] then return kernel_cache[key] end
+    
+    local kernel_weights = {}
+    local half_size = math.floor(kernel_size / 2)
+    local sigma_sq_2 = 2 * sigma_value * sigma_value
+    
+    -- ガウス分布に基づく重みを計算
+    local total_sum = 0
+    for i = 1, kernel_size do
+        local x = i - half_size - 1
+        local weight = math.exp(-x * x / sigma_sq_2)
+        kernel_weights[i] = weight
+        total_sum = total_sum + weight
+    end
+    
+    -- 正規化（合計が1になるように）
+    local inv_sum = 1 / total_sum
+    for i = 1, kernel_size do
+        kernel_weights[i] = kernel_weights[i] * inv_sum
+    end
+    
+    kernel_cache[key] = kernel_weights
+    return kernel_weights
+end
+
+-- ガウシアンフィルタを適用してスムージング
+local function apply_smooth(data, kernel_size, sigma_value, center_idx)
+    local kernel_weights = get_kernel(kernel_size, sigma_value)
+    local half_size = math.floor(kernel_size / 2)
+    local data_len = #data
+    local total_sum = 0
+    
+    local start_idx = math.max(1, center_idx - half_size)
+    local end_idx = math.min(data_len, center_idx + half_size)
+    
+    -- 周辺の値を重み付き平均
+    for i = start_idx, end_idx do
+        local kernel_idx = i - center_idx + half_size + 1
+        total_sum = total_sum + data[i] * kernel_weights[kernel_idx]
+    end
+    
+    return total_sum
+end
+
+-- スペクトルデータを補間（エルミート補間または線形補間）
+local function interpolate_value(spectrum, pos)
+    local spec_len = #spectrum
+    local lower_idx = math.floor(pos)
+    local interp_ratio = pos - lower_idx
+    
+    -- 範囲外の場合は境界値を返す
+    if lower_idx < 1 or lower_idx >= spec_len then
+        return lower_idx < 1 and (spectrum[1] or 0) or (spectrum[spec_len] or 0)
+    end
+    
+    -- エルミート補間（4点での滑らかな補間）
+    if lower_idx >= 2 and lower_idx < spec_len - 1 then
+        local point_0 = spectrum[lower_idx - 1] or 0
+        local point_1 = spectrum[lower_idx] or 0
+        local point_2 = spectrum[lower_idx + 1] or 0
+        local point_3 = spectrum[lower_idx + 2] or 0
+        
+        -- 時間パラメータとその累乗
+        local time = interp_ratio
+        local tangent_1 = (point_2 - point_0) * 0.5  -- 接線1（中心差分）
+        local tangent_2 = (point_3 - point_1) * 0.5  -- 接線2（中心差分）
+        local time_squared = time * time
+        local time_cubed = time_squared * time
+        
+        -- エルミート基底関数
+        local hermite_00 = 2 * time_cubed - 3 * time_squared + 1
+        local hermite_10 = time_cubed - 2 * time_squared + time
+        local hermite_01 = -2 * time_cubed + 3 * time_squared
+        local hermite_11 = time_cubed - time_squared
+        
+        return hermite_00 * point_1 + hermite_10 * tangent_1 + hermite_01 * point_2 + hermite_11 * tangent_2
+    end
+    
+    -- 線形補間（境界付近）
+    local lower_val = spectrum[lower_idx] or 0
+    local upper_val = spectrum[lower_idx + 1] or 0
+    return lower_val + (upper_val - lower_val) * interp_ratio
+end
+
+-- スペクトルを棒グラフとして描画
+local function render_spectrum(config, spectrum, bin_count)
+    if not spectrum or bin_count == 0 then return end
+    
+    obj.setoption("drawtarget", "tempbuffer", config.draw_width, config.screen_height)
+    
+    local bar_count = math.max(1, config.split_count)
+    if bar_count == 0 then return end
+    
+    local bar_width = math.min(config.bar_width, math.ceil(config.draw_width / bar_count) + 1)
+    local bar_step = config.draw_width / bar_count
+    local base_y = config.center_y
+    local bin_per_bar = bin_count / bar_count
+    local half_width = config.draw_width * 0.5
+    local flip = (config.flip_spectrum == 1)
+    local height_scale = config.bar_scale * config.screen_height
+    
+    for i = 1, bar_count do
+        local pos = (i - 0.5) * bin_per_bar + 0.5
+        local interp_value = interpolate_value(spectrum, pos)
+        local bar_offset = (i - 0.5) * bar_step
+        local center_x = bar_offset - half_width
+        
+        local normalized = interp_value / config.spectrum_scale
+        local bar_height = normalized * height_scale
+        
+        local left_x = center_x - bar_width / 2
+        local right_x = center_x + bar_width / 2
+        local top_y = base_y - bar_height
+        local bottom_y = base_y + bar_height
+        
+        local upper = flip and bottom_y or top_y
+        local lower = flip and top_y or bottom_y
+        
+        obj.load("figure", "四角形", config.spectrum_color, 1)
+        obj.drawpoly(
+            left_x, base_y, 0,
+            right_x, base_y, 0,
+            right_x, upper, 0,
+            left_x, upper, 0
+        )
+        
+        if config.mirror_spectrum == 1 then
+            obj.load("figure", "四角形", config.spectrum_color, 1)
+            obj.drawpoly(
+                left_x, base_y, 0,
+                right_x, base_y, 0,
+                right_x, lower, 0,
+                left_x, lower, 0
+            )
+        end
+    end
+end
+
+local audio_data = {}
+obj.getaudio(audio_data, "audiobuffer", "fourier", 1024)
+
+if #audio_data > 0 then
+    audio_data[1] = 0
+    
+    local max_value = 0
+    for i = 1, #audio_data do
+        if audio_data[i] > max_value then max_value = audio_data[i] end
+    end
+    if max_value > 0 then
+        local noise_gate = max_value * config.noise_threshold
+        for i = 1, #audio_data do
+            if audio_data[i] < noise_gate then audio_data[i] = 0 end
+        end
+    end
+    
+    local start_idx = math.max(1, math.min(config.start_freq, #audio_data))
+    local end_idx = math.max(start_idx, math.min(config.end_freq, #audio_data))
+    local audio_range = {}
+    for i = start_idx, end_idx do
+        audio_range[#audio_range + 1] = audio_data[i]
+    end
+    
+    if #audio_range > 0 then
+        if #audio_range >= 2 and config.edge_padding > 0 then
+            local padding_size = config.edge_padding
+            local ref_val = audio_range[1]
+            local slope_val = ref_val - audio_range[2]
+            for i = padding_size, 1, -1 do
+                local fade_ratio = i / padding_size
+                local fade = math.exp(-3 * (1 - fade_ratio))
+                local extrapolated = ref_val + slope_val * (padding_size - i + 1) * 0.1
+                table.insert(audio_range, 1, math.max(0, extrapolated * fade))
+            end
+            local last_idx = #audio_range
+            ref_val = audio_range[last_idx]
+            slope_val = ref_val - audio_range[last_idx - 1]
+            for i = 1, padding_size do
+                local fade_ratio = (padding_size - i + 1) / padding_size
+                local fade = math.exp(-3 * (1 - fade_ratio))
+                local extrapolated = ref_val + slope_val * i * 0.1
+                table.insert(audio_range, math.max(0, extrapolated * fade))
+            end
+        end
+        
+        local smooth_data = {}
+        for i = 1, #audio_range do
+            smooth_data[i] = apply_smooth(audio_range, config.kernel_size, config.sigma_value, i)
+        end
+        
+        render_spectrum(config, smooth_data, #smooth_data)
+        obj.load("tempbuffer")
+    end
+end
+
+@AudioSpectrum_02
+--[[
+    オーディオスペクトラムです。
+    AudioSpectrum_01 の波形を点描画に変更したものです。
+    点の集まりとして波形を線に見立てているので、線の太さや分割数などで調整してください。
+    細かな設定は local config のところをいじってください。
+]]
+--track@start_freq:最小範囲,0,1023,0,1
+--track@end_freq:最大範囲,1,1024,64,1
+--track@split_count:分割数,1,2048,1024,1
+--track@draw_width:横幅,100,1920,1024,1
+--track@bar_width:線太さ,1,1024,1,1
+--track@bar_scale:波形高さ,1,16,4,0.1
+--check@flip_spectrum:上下反転,0
+--check@mirror_spectrum:ミラー,0
+--color@spectrum_color:色,0x02edaf 
+
+local config = {
+    -- 定数
+    spectrum_scale       = 400000,                       -- 波形スケール
+    center_y             = 0,                            -- 点描画基点Y座標
+
+    -- 表示設定
+    start_freq           = start_freq,                    -- 周波数範囲（開始）
+    end_freq             = end_freq,                      -- 周波数範囲（終了）
+    split_count          = split_count,                   -- 周波数分割数
+    draw_width           = draw_width,                     -- 横幅
+    spectrum_color       = spectrum_color,               -- 波形の色
+    bar_width            = bar_width,                     -- 点太さ
+    bar_scale            = bar_scale,                     -- 点高さ倍率
+    flip_spectrum        = flip_spectrum,                -- 上下反転
+    mirror_spectrum      = mirror_spectrum,              -- ミラー表示
+    screen_height        = obj.screen_h,                 -- 画面縦幅
+
+    -- 処理設定
+    sigma_value          = 2.5,                          -- シグマ値
+    noise_threshold      = 0.1,                          -- ノイズゲート閾値
+    kernel_size          = 21,                           -- カーネルサイズ（奇数推奨）
+    edge_padding         = 3,                            -- エッジパディング幅
+}
+
+local kernel_cache = {}
+local function get_kernel(kernel_size, sigma_value)
+    local key = kernel_size .. "_" .. sigma_value
+    if kernel_cache[key] then return kernel_cache[key] end
+    
+    local kernel_weights = {}
+    local half_size = math.floor(kernel_size / 2)
+    local sigma_sq_2 = 2 * sigma_value * sigma_value
+    
+    local total_sum = 0
+    for i = 1, kernel_size do
+        local x = i - half_size - 1
+        local weight = math.exp(-x * x / sigma_sq_2)
+        kernel_weights[i] = weight
+        total_sum = total_sum + weight
+    end
+    
+    local inv_sum = 1 / total_sum
+    for i = 1, kernel_size do
+        kernel_weights[i] = kernel_weights[i] * inv_sum
+    end
+    
+    kernel_cache[key] = kernel_weights
+    return kernel_weights
+end
+
+local function apply_smooth(data, kernel_size, sigma_value, center_idx)
+    local kernel_weights = get_kernel(kernel_size, sigma_value)
+    local half_size = math.floor(kernel_size / 2)
+    local data_len = #data
+    local total_sum = 0
+    
+    local start_idx = math.max(1, center_idx - half_size)
+    local end_idx = math.min(data_len, center_idx + half_size)
+    
+    for i = start_idx, end_idx do
+        local kernel_idx = i - center_idx + half_size + 1
+        total_sum = total_sum + data[i] * kernel_weights[kernel_idx]
+    end
+    
+    return total_sum
+end
+
+local function interpolate_value(spectrum, pos)
+    local spec_len = #spectrum
+    local lower_idx = math.floor(pos)
+    local interp_ratio = pos - lower_idx
+    
+    if lower_idx < 1 or lower_idx >= spec_len then
+        return lower_idx < 1 and (spectrum[1] or 0) or (spectrum[spec_len] or 0)
+    end
+    
+    if lower_idx >= 2 and lower_idx < spec_len - 1 then
+        local p0 = spectrum[lower_idx - 1] or 0
+        local p1 = spectrum[lower_idx] or 0
+        local p2 = spectrum[lower_idx + 1] or 0
+        local p3 = spectrum[lower_idx + 2] or 0
+        
+        local t = interp_ratio
+        local tangent1 = (p2 - p0) * 0.5
+        local tangent2 = (p3 - p1) * 0.5
+        local t2 = t * t
+        local t3 = t2 * t
+        local h00 = 2 * t3 - 3 * t2 + 1
+        local h10 = t3 - 2 * t2 + t
+        local h01 = -2 * t3 + 3 * t2
+        local h11 = t3 - t2
+        
+        return h00 * p1 + h10 * tangent1 + h01 * p2 + h11 * tangent2
+    end
+    
+    local lower_val = spectrum[lower_idx] or 0
+    local upper_val = spectrum[lower_idx + 1] or 0
+    return lower_val + (upper_val - lower_val) * interp_ratio
+end
+
+-- スペクトルを点として描画
+local function render_points(config, spectrum, bin_count)
+    if not spectrum or bin_count == 0 then return end
+    
+    obj.setoption("drawtarget", "tempbuffer", config.draw_width, config.screen_height)
+    
+    local bar_count = math.max(1, config.split_count)
+    if bar_count == 0 then return end
+    
+    local bar_step = config.draw_width / bar_count
+    local base_y = config.center_y
+    local bin_per_bar = bin_count / bar_count
+    local half_width = config.draw_width * 0.5
+    local flip = (config.flip_spectrum == 1)
+    local height_scale = config.bar_scale * config.screen_height
+    local point_radius = math.floor(config.bar_width)
+    
+    -- 各分割ポイントに点を描画
+    for i = 1, bar_count do
+        local pos = (i - 0.5) * bin_per_bar + 0.5
+        local interp_value = interpolate_value(spectrum, pos)
+        local bar_offset = (i - 0.5) * bar_step
+        local point_x = bar_offset - half_width
+        
+        local normalized = interp_value / config.spectrum_scale
+        local point_height = normalized * height_scale
+        local point_y = flip and (base_y + point_height) or (base_y - point_height)
+        
+        -- メイン点を描画
+        obj.load("figure", "四角形", config.spectrum_color, 1)
+        obj.drawpoly(
+            point_x - point_radius, point_y - point_radius, 0,
+            point_x + point_radius, point_y - point_radius, 0,
+            point_x + point_radius, point_y + point_radius, 0,
+            point_x - point_radius, point_y + point_radius, 0
+        )
+        
+        -- ミラー表示
+        if config.mirror_spectrum == 1 then
+            local mirror_y = flip and (base_y - point_height) or (base_y + point_height)
+            obj.load("figure", "四角形", config.spectrum_color, 1)
+            obj.drawpoly(
+                point_x - point_radius, mirror_y - point_radius, 0,
+                point_x + point_radius, mirror_y - point_radius, 0,
+                point_x + point_radius, mirror_y + point_radius, 0,
+                point_x - point_radius, mirror_y + point_radius, 0
+            )
+        end
+    end
+end
+
+-- 音声データを取得して処理
+local audio_data = {}
+obj.getaudio(audio_data, "audiobuffer", "fourier", 1024)
+ 
+if #audio_data > 0 then
+    audio_data[1] = 0
+    
+    local max_value = 0
+    for i = 1, #audio_data do
+        if audio_data[i] > max_value then max_value = audio_data[i] end
+    end
+    if max_value > 0 then
+        local noise_gate = max_value * config.noise_threshold
+        for i = 1, #audio_data do
+            if audio_data[i] < noise_gate then audio_data[i] = 0 end
+        end
+    end
+    
+    local start_idx = math.max(1, math.min(config.start_freq, #audio_data))
+    local end_idx = math.max(start_idx, math.min(config.end_freq, #audio_data))
+    local audio_range = {}
+    for i = start_idx, end_idx do
+        audio_range[#audio_range + 1] = audio_data[i]
+    end
+    
+    if #audio_range > 0 then
+        if #audio_range >= 2 and config.edge_padding > 0 then
+            local padding_size = config.edge_padding
+            local ref_val = audio_range[1]
+            local slope_val = ref_val - audio_range[2]
+            for i = padding_size, 1, -1 do
+                local fade_ratio = i / padding_size
+                local fade = math.exp(-3 * (1 - fade_ratio))
+                local extrapolated = ref_val + slope_val * (padding_size - i + 1) * 0.1
+                table.insert(audio_range, 1, math.max(0, extrapolated * fade))
+            end
+            local last_idx = #audio_range
+            ref_val = audio_range[last_idx]
+            slope_val = ref_val - audio_range[last_idx - 1]
+            for i = 1, padding_size do
+                local fade_ratio = (padding_size - i + 1) / padding_size
+                local fade = math.exp(-3 * (1 - fade_ratio))
+                local extrapolated = ref_val + slope_val * i * 0.1
+                table.insert(audio_range, math.max(0, extrapolated * fade))
+            end
+        end
+        
+        local smooth_data = {}
+        for i = 1, #audio_range do
+            smooth_data[i] = apply_smooth(audio_range, config.kernel_size, config.sigma_value, i)
+        end
+        
+        render_points(config, smooth_data, #smooth_data)
+        obj.load("tempbuffer")
+    end
+end
+
+@AudioSpectrum_03
+--[[
+    オーディオスペクトラムです。
+    音声波形を描画します。
+    AudioSpectrum_01 は 音声を離散フーリエ変換したデータを使用して波形を描画していましたが、こちらは周波数毎の音量データを使用しています。
+    細かな設定は local config のところをいじってください。
+]] 
+--track@start_freq:最小範囲,0,1023,0,1
+--track@end_freq:最大範囲,1,1024,1024,1
+--track@split_count:分割数,1,2048,128,1
+--track@draw_width:横幅,100,1920,1024,1
+--track@bar_width:線太さ,1,1024,5,1
+--track@bar_scale:波形高さ,1,16,4,1
+--check@flip_spectrum:上下反転,0
+--check@mirror_spectrum:ミラー,0
+--color@spectrum_color:色,0x02edaf
+
+-- 設定値
+local config = {
+    -- 定数
+    spectrum_scale       = 400000,                       -- 波形スケール
+    center_y             = 0,                            -- バー描画基点Y座標
+
+    -- 表示設定
+    start_freq           = start_freq,                    -- 周波数範囲（開始）
+    end_freq             = end_freq,                      -- 周波数範囲（終了）
+    split_count          = split_count,                   -- 周波数分割数
+    draw_width           = draw_width,                     -- 横幅
+    spectrum_color       = spectrum_color,               -- 波形の色
+    bar_width            = bar_width,                     -- バー太さ
+    bar_scale            = bar_scale,                     -- バー高さ倍率
+    flip_spectrum        = flip_spectrum,                -- 上下反転
+    mirror_spectrum      = mirror_spectrum,              -- ミラー表示
+    screen_height        = obj.screen_h,                 -- 画面縦幅
+
+    -- 処理設定
+    sigma_value          = 2.5,                          -- シグマ値
+    noise_threshold      = 0.1,                          -- ノイズゲート閾値
+    kernel_size          = 9,                           -- カーネルサイズ（奇数推奨）
+    edge_padding         = 3,                            -- エッジパディング幅
+}
+
+local kernel_cache = {}
+local function get_kernel(kernel_size, sigma_value)
+    local key = kernel_size .. "_" .. sigma_value
+    if kernel_cache[key] then return kernel_cache[key] end
+    
+    local kernel_weights = {}
+    local half_size = math.floor(kernel_size / 2)
+    local sigma_sq_2 = 2 * sigma_value * sigma_value
+    
+    local total_sum = 0
+    for i = 1, kernel_size do
+        local x = i - half_size - 1
+        local weight = math.exp(-x * x / sigma_sq_2)
+        kernel_weights[i] = weight
+        total_sum = total_sum + weight
+    end
+    
+    local inv_sum = 1 / total_sum
+    for i = 1, kernel_size do
+        kernel_weights[i] = kernel_weights[i] * inv_sum
+    end
+    
+    kernel_cache[key] = kernel_weights
+    return kernel_weights
+end
+
+local function apply_smooth(data, kernel_size, sigma_value, center_idx)
+    local kernel_weights = get_kernel(kernel_size, sigma_value)
+    local half_size = math.floor(kernel_size / 2)
+    local data_len = #data
+    local total_sum = 0
+    
+    local start_idx = math.max(1, center_idx - half_size)
+    local end_idx = math.min(data_len, center_idx + half_size)
+    
+    for i = start_idx, end_idx do
+        local kernel_idx = i - center_idx + half_size + 1
+        total_sum = total_sum + data[i] * kernel_weights[kernel_idx]
+    end
+    
+    return total_sum
+end
+
+local function interpolate_value(spectrum, pos)
+    local spec_len = #spectrum
+    local lower_idx = math.floor(pos)
+    local interp_ratio = pos - lower_idx
+    
+    if lower_idx < 1 or lower_idx >= spec_len then
+        return lower_idx < 1 and (spectrum[1] or 0) or (spectrum[spec_len] or 0)
+    end
+    
+    if lower_idx >= 2 and lower_idx < spec_len - 1 then
+        local p0 = spectrum[lower_idx - 1] or 0
+        local p1 = spectrum[lower_idx] or 0
+        local p2 = spectrum[lower_idx + 1] or 0
+        local p3 = spectrum[lower_idx + 2] or 0
+        
+        local t = interp_ratio
+        local tangent1 = (p2 - p0) * 0.5
+        local tangent2 = (p3 - p1) * 0.5
+        local t2 = t * t
+        local t3 = t2 * t
+        local h00 = 2 * t3 - 3 * t2 + 1
+        local h10 = t3 - 2 * t2 + t
+        local h01 = -2 * t3 + 3 * t2
+        local h11 = t3 - t2
+        
+        return h00 * p1 + h10 * tangent1 + h01 * p2 + h11 * tangent2
+    end
+    
+    local lower_val = spectrum[lower_idx] or 0
+    local upper_val = spectrum[lower_idx + 1] or 0
+    return lower_val + (upper_val - lower_val) * interp_ratio
+end
+
+-- スペクトルを棒グラフとして描画（周波数毎の音量データ版）
+local function render_spectrum(config, spectrum, bin_count)
+    if not spectrum or bin_count == 0 then return end
+    
+    obj.setoption("drawtarget", "tempbuffer", config.draw_width, config.screen_height)
+    
+    local bar_count = math.max(1, config.split_count)
+    if bar_count == 0 then return end
+    
+    local bar_width = math.min(config.bar_width, math.ceil(config.draw_width / bar_count) + 1)
+    local bar_step = config.draw_width / bar_count
+    local base_y = config.center_y
+    local bin_per_bar = bin_count / bar_count
+    local half_width = config.draw_width * 0.5
+    local flip = (config.flip_spectrum == 1)
+    local height_scale = config.bar_scale * config.screen_height
+    
+    for i = 1, bar_count do
+        local pos = (i - 0.5) * bin_per_bar + 0.5
+        local interp_value = interpolate_value(spectrum, pos)
+        local bar_offset = (i - 0.5) * bar_step
+        local center_x = bar_offset - half_width
+        
+        local normalized = interp_value / config.spectrum_scale
+        local bar_height = normalized * height_scale
+        
+        local left_x = center_x - bar_width / 2
+        local right_x = center_x + bar_width / 2
+        local top_y = base_y - bar_height
+        local bottom_y = base_y + bar_height
+        
+        local upper = flip and bottom_y or top_y
+        local lower = flip and top_y or bottom_y
+        
+        obj.load("figure", "四角形", config.spectrum_color, 1)
+        obj.drawpoly(
+            left_x, base_y, 0,
+            right_x, base_y, 0,
+            right_x, upper, 0,
+            left_x, upper, 0
+        )
+        
+        if config.mirror_spectrum == 1 then
+            obj.load("figure", "四角形", config.spectrum_color, 1)
+            obj.drawpoly(
+                left_x, base_y, 0,
+                right_x, base_y, 0,
+                right_x, lower, 0,
+                left_x, lower, 0
+            )
+        end
+    end
+end
+
+local audio_data = {}
+obj.getaudio(audio_data, "audiobuffer", "spectrum", 1024)
+
+if #audio_data > 0 then
+    audio_data[1] = 0
+    
+    local max_value = 0
+    for i = 1, #audio_data do
+        if audio_data[i] > max_value then max_value = audio_data[i] end
+    end
+    if max_value > 0 then
+        local noise_gate = max_value * config.noise_threshold
+        for i = 1, #audio_data do
+            if audio_data[i] < noise_gate then audio_data[i] = 0 end
+        end
+    end
+    
+    local start_idx = math.max(1, math.min(config.start_freq, #audio_data))
+    local end_idx = math.max(start_idx, math.min(config.end_freq, #audio_data))
+    local audio_range = {}
+    for i = start_idx, end_idx do
+        audio_range[#audio_range + 1] = audio_data[i]
+    end
+    
+    if #audio_range > 0 then
+        if #audio_range >= 2 and config.edge_padding > 0 then
+            local padding_size = config.edge_padding
+            local ref_val = audio_range[1]
+            local slope_val = ref_val - audio_range[2]
+            for i = padding_size, 1, -1 do
+                local fade_ratio = i / padding_size
+                local fade = math.exp(-3 * (1 - fade_ratio))
+                local extrapolated = ref_val + slope_val * (padding_size - i + 1) * 0.1
+                table.insert(audio_range, 1, math.max(0, extrapolated * fade))
+            end
+            local last_idx = #audio_range
+            ref_val = audio_range[last_idx]
+            slope_val = ref_val - audio_range[last_idx - 1]
+            for i = 1, padding_size do
+                local fade_ratio = (padding_size - i + 1) / padding_size
+                local fade = math.exp(-3 * (1 - fade_ratio))
+                local extrapolated = ref_val + slope_val * i * 0.1
+                table.insert(audio_range, math.max(0, extrapolated * fade))
+            end
+        end
+        
+        local smooth_data = {}
+        for i = 1, #audio_range do
+            smooth_data[i] = apply_smooth(audio_range, config.kernel_size, config.sigma_value, i)
+        end
+        
+        render_spectrum(config, smooth_data, #smooth_data)
+        obj.load("tempbuffer")
+    end
+end
+
+@AudioSpectrum_04
+--[[
+    オーディオスペクトラムです。
+    音声波形を描画します。
+    AudioSpectrum_03 の波形を点描画に変更したものです。
+]]
+--track@start_freq:最小範囲,0,1023,0,1
+--track@end_freq:最大範囲,1,1024,1024,1
+--track@split_count:分割数,1,2048,1024,1
+--track@draw_width:横幅,100,1920,1024,1
+--track@bar_width:線太さ,1,1024,1,1
+--track@bar_scale:波形高さ,1,16,4,0.1
+--check@flip_spectrum:上下反転,0
+--check@mirror_spectrum:ミラー,0
+--color@spectrum_color:色,0x02edaf 
+
+local config = {
+    -- 定数
+    spectrum_scale       = 400000,                       -- 波形スケール
+    center_y             = 0,                            -- 点描画基点Y座標
+
+    -- 表示設定
+    start_freq           = start_freq,                    -- 周波数範囲（開始）
+    end_freq             = end_freq,                      -- 周波数範囲（終了）
+    split_count          = split_count,                   -- 周波数分割数
+    draw_width           = draw_width,                     -- 横幅
+    spectrum_color       = spectrum_color,               -- 波形の色
+    bar_width            = bar_width,                     -- 点太さ
+    bar_scale            = bar_scale,                     -- 点高さ倍率
+    flip_spectrum        = flip_spectrum,                -- 上下反転
+    mirror_spectrum      = mirror_spectrum,              -- ミラー表示
+    screen_height        = obj.screen_h,                 -- 画面縦幅
+
+    -- 処理設定
+    sigma_value          = 2.5,                          -- シグマ値
+    noise_threshold      = 0.1,                          -- ノイズゲート閾値
+    kernel_size          = 21,                           -- カーネルサイズ（奇数推奨）
+    edge_padding         = 3,                            -- エッジパディング幅
+}
+
+local kernel_cache = {}
+local function get_kernel(kernel_size, sigma_value)
+    local key = kernel_size .. "_" .. sigma_value
+    if kernel_cache[key] then return kernel_cache[key] end
+    
+    local kernel_weights = {}
+    local half_size = math.floor(kernel_size / 2)
+    local sigma_sq_2 = 2 * sigma_value * sigma_value
+    
+    local total_sum = 0
+    for i = 1, kernel_size do
+        local x = i - half_size - 1
+        local weight = math.exp(-x * x / sigma_sq_2)
+        kernel_weights[i] = weight
+        total_sum = total_sum + weight
+    end
+    
+    local inv_sum = 1 / total_sum
+    for i = 1, kernel_size do
+        kernel_weights[i] = kernel_weights[i] * inv_sum
+    end
+    
+    kernel_cache[key] = kernel_weights
+    return kernel_weights
+end
+
+local function apply_smooth(data, kernel_size, sigma_value, center_idx)
+    local kernel_weights = get_kernel(kernel_size, sigma_value)
+    local half_size = math.floor(kernel_size / 2)
+    local data_len = #data
+    local total_sum = 0
+    
+    local start_idx = math.max(1, center_idx - half_size)
+    local end_idx = math.min(data_len, center_idx + half_size)
+    
+    for i = start_idx, end_idx do
+        local kernel_idx = i - center_idx + half_size + 1
+        total_sum = total_sum + data[i] * kernel_weights[kernel_idx]
+    end
+    
+    return total_sum
+end
+
+local function interpolate_value(spectrum, pos)
+    local spec_len = #spectrum
+    local lower_idx = math.floor(pos)
+    local interp_ratio = pos - lower_idx
+    
+    if lower_idx < 1 or lower_idx >= spec_len then
+        return lower_idx < 1 and (spectrum[1] or 0) or (spectrum[spec_len] or 0)
+    end
+    
+    if lower_idx >= 2 and lower_idx < spec_len - 1 then
+        local p0 = spectrum[lower_idx - 1] or 0
+        local p1 = spectrum[lower_idx] or 0
+        local p2 = spectrum[lower_idx + 1] or 0
+        local p3 = spectrum[lower_idx + 2] or 0
+        
+        local t = interp_ratio
+        local tangent1 = (p2 - p0) * 0.5
+        local tangent2 = (p3 - p1) * 0.5
+        local t2 = t * t
+        local t3 = t2 * t
+        local h00 = 2 * t3 - 3 * t2 + 1
+        local h10 = t3 - 2 * t2 + t
+        local h01 = -2 * t3 + 3 * t2
+        local h11 = t3 - t2
+        
+        return h00 * p1 + h10 * tangent1 + h01 * p2 + h11 * tangent2
+    end
+    
+    local lower_val = spectrum[lower_idx] or 0
+    local upper_val = spectrum[lower_idx + 1] or 0
+    return lower_val + (upper_val - lower_val) * interp_ratio
+end
+
+-- スペクトルを点として描画（周波数毎の音量データ版）
+local function render_points(config, spectrum, bin_count)
+    if not spectrum or bin_count == 0 then return end
+    
+    obj.setoption("drawtarget", "tempbuffer", config.draw_width, config.screen_height)
+    
+    local bar_count = math.max(1, config.split_count)
+    if bar_count == 0 then return end
+    
+    local bar_step = config.draw_width / bar_count
+    local base_y = config.center_y
+    local bin_per_bar = bin_count / bar_count
+    local half_width = config.draw_width * 0.5
+    local flip = (config.flip_spectrum == 1)
+    local height_scale = config.bar_scale * config.screen_height
+    local radius = math.floor(config.bar_width)
+    
+    for i = 1, bar_count do
+        local pos = (i - 0.5) * bin_per_bar + 0.5
+        local interp_value = interpolate_value(spectrum, pos)
+        local bar_offset = (i - 0.5) * bar_step
+        local x = bar_offset - half_width
+        
+        local normalized = interp_value / config.spectrum_scale
+        local point_height = normalized * height_scale
+        local y = flip and (base_y + point_height) or (base_y - point_height)
+        
+        obj.load("figure", "四角形", config.spectrum_color, 1)
+        obj.drawpoly(
+            x - radius, y - radius, 0,
+            x + radius, y - radius, 0,
+            x + radius, y + radius, 0,
+            x - radius, y + radius, 0
+        )
+        
+        if config.mirror_spectrum == 1 then
+            local mirror_y = flip and (base_y - point_height) or (base_y + point_height)
+            obj.load("figure", "四角形", config.spectrum_color, 1)
+            obj.drawpoly(
+                x - radius, mirror_y - radius, 0,
+                x + radius, mirror_y - radius, 0,
+                x + radius, mirror_y + radius, 0,
+                x - radius, mirror_y + radius, 0
+            )
+        end
+    end
+end
+
+local audio_data = {}
+obj.getaudio(audio_data, "audiobuffer", "spectrum", 1024)
+
+if #audio_data > 0 then
+    audio_data[1] = 0
+    
+    local max_value = 0
+    for i = 1, #audio_data do
+        if audio_data[i] > max_value then max_value = audio_data[i] end
+    end
+    if max_value > 0 then
+        local noise_gate = max_value * config.noise_threshold
+        for i = 1, #audio_data do
+            if audio_data[i] < noise_gate then audio_data[i] = 0 end
+        end
+    end
+    
+    local start_idx = math.max(1, math.min(config.start_freq, #audio_data))
+    local end_idx = math.max(start_idx, math.min(config.end_freq, #audio_data))
+    local audio_range = {}
+    for i = start_idx, end_idx do
+        audio_range[#audio_range + 1] = audio_data[i]
+    end
+    
+    if #audio_range > 0 then
+        if #audio_range >= 2 and config.edge_padding > 0 then
+            local padding_size = config.edge_padding
+            local ref_val = audio_range[1]
+            local slope_val = ref_val - audio_range[2]
+            for i = padding_size, 1, -1 do
+                local fade_ratio = i / padding_size
+                local fade = math.exp(-3 * (1 - fade_ratio))
+                local extrapolated = ref_val + slope_val * (padding_size - i + 1) * 0.1
+                table.insert(audio_range, 1, math.max(0, extrapolated * fade))
+            end
+            local last_idx = #audio_range
+            ref_val = audio_range[last_idx]
+            slope_val = ref_val - audio_range[last_idx - 1]
+            for i = 1, padding_size do
+                local fade_ratio = (padding_size - i + 1) / padding_size
+                local fade = math.exp(-3 * (1 - fade_ratio))
+                local extrapolated = ref_val + slope_val * i * 0.1
+                table.insert(audio_range, math.max(0, extrapolated * fade))
+            end
+        end
+        
+        local smooth_data = {}
+        for i = 1, #audio_range do
+            smooth_data[i] = apply_smooth(audio_range, config.kernel_size, config.sigma_value, i)
+        end
+        
+        render_points(config, smooth_data, #smooth_data)
+        obj.load("tempbuffer")
+    end
+end
+
+@AudioSpectrum_05
+--[[
+    オーディオスペクトラムです。
+    デフォルトの音声波形(Type1)を少し滑らかにした音声波形を描画します。
+    基本は obj.getaudio() で取得した音声波形データを使用していますが、滑らかにするためにガウシアンカーネルで平滑化処理を追加しています。
+]] 
+--track@freq_range:範囲,1,1024,1024,1
+--track@spectrum_split:分割数,0,2048,128,1
+--track@draw_width:横幅,100,1920,512,1
+--track@sigma_value:平滑度,0.1,100,4,0.1
+--track@bar_width:線太さ（棒）,1,1024,4,1
+--track@bar_scale:波形高さ,1,16,2,0.1
+--track@alpha_percent:透明度（棒）,0,100,64,1
+--track@line_split:分割数(線),1,10000,4098,1
+--track@line_size:線太さ（線）,1,1024,8,1
+--track@baseline_size:基線太さ ,1,1024,1,1
+--check@show_bar:棒,1
+--check@show_line:線,1
+--check@base_line:基線,0
+--color@spectrum_color:色(塗り),0xffffff
+--color@line_color:色(線),0x02edaf
+--color@baseline_color:色(基線),0x02edaf
+
+-- 設定値
+local config = {
+    -- 定数
+    spectrum_scale  = 100000,                    -- 波形スケール
+    kernel_size     = 255,                       -- カーネルサイズ
+    center_y        = 0,                         -- 描画基点Y座標
+
+    -- 棒グラフ設定
+    sigma_value     = sigma_value,                -- シグマ値（スムージング度合い）
+    freq_range      = freq_range,                  -- 周波数範囲
+    spectrum_split  = spectrum_split,              -- スペクトラム分割数
+    draw_width      = draw_width,                  -- 横幅
+    spectrum_color  = spectrum_color,            -- スペクトラム色
+    bar_width       = bar_width,                  -- バー太さ
+    bar_scale       = bar_scale / 10 or 0.4,     -- バー高さ倍率
+    alpha_value     = 1 - (alpha_percent / 100), -- 透明度
+    show_bar        = show_bar,                  -- 棒表示フラグ
+
+    -- 線グラフ設定
+    line_color      = line_color,                -- 線色
+    line_size       = line_size,                  -- 線太さ
+    line_split      = line_split,                 -- 線分割数
+    show_line       = show_line,                 -- 線表示フラグ
+    
+    -- 基線設定
+    base_line       = base_line,                 -- 基線表示フラグ
+    baseline_color  = baseline_color,            -- 基線色
+    baseline_size   = baseline_size / 2,          -- 基線太さ
+    
+    screen_height   = obj.screen_h,              -- 画面縦幅
+}
+
+-- ガウシアンカーネルのキャッシュ（再計算を避けるため）
+local kernel_cache = {}
+
+-- ガウシアンカーネルを生成（スムージング用）
+local function get_kernel(kernel_size, sigma_value)
+    local key = kernel_size .. "_" .. sigma_value
+    if kernel_cache[key] then return kernel_cache[key] end
+    
+    local kernel_weights = {}
+    local half_size = math.floor(kernel_size / 2)
+    local sigma_sq_2 = 2 * sigma_value * sigma_value
+    
+    -- ガウス分布に基づく重みを計算
+    local total_sum = 0
+    for i = 1, kernel_size do
+        local x = i - half_size - 1
+        local weight = math.exp(-x * x / sigma_sq_2)
+        kernel_weights[i] = weight
+        total_sum = total_sum + weight
+    end
+    
+    -- 正規化（合計が1になるように）
+    local inv_sum = 1 / total_sum
+    for i = 1, kernel_size do
+        kernel_weights[i] = kernel_weights[i] * inv_sum
+    end
+    
+    kernel_cache[key] = kernel_weights
+    return kernel_weights
+end
+
+-- ガウシアンフィルタを適用してスムージング
+local function apply_smooth(data, kernel_size, sigma_value, center_idx)
+    local kernel_weights = get_kernel(kernel_size, sigma_value)
+    local half_size = math.floor(kernel_size / 2)
+    local data_len = #data
+    local total_sum = 0
+    
+    local start_idx = math.max(1, center_idx - half_size)
+    local end_idx = math.min(data_len, center_idx + half_size)
+    
+    -- 周辺の値を重み付き平均
+    for i = start_idx, end_idx do
+        local kernel_idx = i - center_idx + half_size + 1
+        total_sum = total_sum + data[i] * kernel_weights[kernel_idx]
+    end
+    
+    return total_sum
+end
+
+-- 線形補間
+local function interpolate_linear(data, pos)
+    local lower_idx = math.floor(pos)
+    local upper_idx = math.min(lower_idx + 1, #data)
+    local ratio = pos - lower_idx
+    local lower_val = data[lower_idx] or 0
+    local upper_val = data[upper_idx] or 0
+    return lower_val * (1 - ratio) + upper_val * ratio
+end
+
+-- 音声データを取得して処理
+local audio_data = {}
+obj.getaudio(audio_data, "audiobuffer", "pcm", 1024)
+
+if #audio_data > 0 then
+    -- 周波数範囲を抽出
+    local audio_range = {}
+    for i = 1, math.min(config.freq_range, #audio_data) do
+        audio_range[i] = audio_data[i]
+    end
+    
+    -- スムージング処理
+    local smooth_data = {}
+    for i = 1, #audio_range do
+        smooth_data[i] = apply_smooth(audio_range, config.kernel_size, config.sigma_value, i)
+    end
+    
+    -- 描画バッファを設定
+    obj.setoption("drawtarget", "tempbuffer", config.draw_width, config.screen_height * config.bar_scale * 2)
+    
+    -- 描画パラメータを計算
+    local bin_count = #smooth_data
+    local bar_count = config.spectrum_split
+    local bar_width = math.min(config.bar_width, math.ceil(config.draw_width / bar_count) + 1)
+    local bar_step = config.draw_width / bar_count
+    local base_y = config.center_y
+    local half_width = config.draw_width * 0.5
+    local height_scale = config.bar_scale * config.screen_height
+    local inv_scale = 1 / config.spectrum_scale
+    local bin_ratio = bin_count / bar_count
+    
+    -- 棒グラフを描画
+    if config.show_bar == 1 then
+        for i = 1, bar_count do
+            local pos = (i - 0.5) * bin_ratio + 0.5
+            local interp_value = interpolate_linear(smooth_data, pos)
+            local bar_height = interp_value * inv_scale * height_scale
+            local bar_x = bar_step * (i - 0.5) - half_width
+            local bar_left = bar_x - bar_width / 2
+            local bar_right = bar_x + bar_width / 2
+            local bar_top = base_y - bar_height
+            
+            obj.load("figure", "四角形", config.spectrum_color, 1)
+            obj.drawpoly(
+                bar_left, base_y + 1, 0,
+                bar_right, base_y + 1, 0,
+                bar_right, bar_top - 1, 0,
+                bar_left, bar_top - 1, 0,
+                0, 0, 0, 0, 0.0, 0, 0, 0, config.alpha_value
+            )
+        end
+    end
+    
+    -- 線グラフを描画
+    if config.show_line == 1 then
+        local line_count = config.line_split
+        local line_step = config.draw_width / line_count
+        local line_radius = math.floor(config.line_size) / 2
+        local line_width = line_step
+        local line_ratio = bin_count / line_count
+        
+        for i = 1, line_count do
+            local pos = (i - 0.5) * line_ratio + 0.5
+            local interp_value = interpolate_linear(smooth_data, pos)
+            local line_height = interp_value * inv_scale * height_scale
+            local line_x = line_step * (i - 0.5) - half_width
+            local line_top = base_y - line_height
+            
+            obj.load("figure", "四角形", config.line_color, 1)
+            obj.drawpoly(
+                line_x - line_width / 2, line_top - line_radius, 0,
+                line_x + line_width / 2, line_top - line_radius, 0,
+                line_x + line_width / 2, line_top + line_radius, 0,
+                line_x - line_width / 2, line_top + line_radius, 0
+            )
+        end
+    end
+    
+    -- 基線を描画
+    if config.base_line == 1 then
+        obj.load("figure", "四角形", config.baseline_color, 1)
+        obj.drawpoly(
+            -half_width, base_y + config.baseline_size / 2, 0,
+            half_width, base_y + config.baseline_size / 2, 0,
+            half_width, base_y - config.baseline_size / 2 - 1, 0,
+            -half_width, base_y - config.baseline_size / 2 - 1, 0
+        )
+    end
+    
+    obj.load("tempbuffer")
+end
+
+@VolumeMeter
+--[[
+    ボリュームメーターです。
+    左右チャンネルとモノラルの3種類に対応しています。
+    デシベル表記は実際の値と乖離があるかもしれません。検証してません。
+]]
+--track@bar_width:横幅,0,1980,20,0.1
+--track@bar_height:高さ,0,1080,256,0.1
+--track@bar_spacing:間隔,0,1980,64,0.1
+--select@display_type:表示タイプ,左右=1,左のみ=2,右のみ=3,モノラル=4
+--track@text_size:文字サイズ,8,128,32,1
+--track@sample_count:サンプル数,1,1024,64,1
+--check@type_switch:表示切替,0
+--font@text_font:フォント,游ゴシック Light
+--color@left_color:左チャンネル色,0x02edaf
+--color@right_color:右チャンネル色,0xff6b6b
+--color@mono_color:モノラル色,0xaaaaaa
+--dialog:単位表記,local db_unit = "dB";無音表記,local min_text = "-Inf"
+
+-- 設定値
+local config = {
+    -- バー設定
+    bar_width    = bar_width,                         -- バー幅
+    bar_height   = bar_height,                         -- バー高さ
+    bar_spacing  = bar_spacing,                        -- バー間隔
+    
+    -- 表示設定
+    display_type = display_type,                     -- 表示タイプ（1:左右 2:左のみ 3:右のみ 4:モノラル）
+    text_font    = text_font,                        -- 文字フォント
+    text_size    = text_size,                         -- 文字サイズ
+    type_switch  = type_switch,                      -- 表示切替（0:バー 1:テキスト）
+    sample_count = sample_count,                      -- サンプル数（取得したサンプルの中で音量の平均をとります。最大値を得たい場合は1にしてください。）
+    
+    -- 色設定
+    left_color   = left_color,                       -- 左チャンネル色
+    right_color  = right_color,                      -- 右チャンネル色
+    mono_color   = mono_color,                       -- モノラル色
+    
+    -- デシベル設定
+    min_db       = -100,                             -- 最小デシベル値
+    max_db       = 0,                                -- 最大デシベル値
+    db_unit      = db_unit,                          -- 単位表記（文字を全て消すと単位が非表示になります）
+    min_text     = min_text,                         -- 無音時表記（文字を全て消すと無音時表記が非表示になります）
+}
+
+-- デシベル計算用の定数
+local min_db = config.min_db
+local db_inv = 1 / (config.max_db - config.min_db)
+local rms_factor = 20 / math.log(10)
+local spec_inv = 1 / 32767
+local half_width = config.bar_width * 0.5
+local min_text = config.min_text .. " " .. config.db_unit
+
+-- 再利用するテーブル（GC負荷削減）
+local left_data = {}
+local right_data = {}
+local single_data = {}
+
+-- 音声データからRMSを計算しdB値に変換
+local function calc_db(audio_buf, data_count)
+    if data_count == 0 then return min_db end
+    local sum_sq = 0
+    for i = 1, data_count do
+        local audio_sample = audio_buf[i]
+        sum_sq = sum_sq + audio_sample * audio_sample
+    end
+    local rms_value = math.sqrt(sum_sq / data_count)
+    return rms_value > 0 and rms_factor * math.log(rms_value * spec_inv) or min_db
+end
+
+-- 左右チャンネルを平均化してdB値を計算
+local function calc_avg(left_buf, right_buf, data_count)
+    if data_count == 0 then return min_db end
+    local sum_sq = 0
+    for i = 1, data_count do
+        local avg_sample = left_buf[i] + right_buf[i]
+        sum_sq = sum_sq + avg_sample * avg_sample
+    end
+    local rms_value = math.sqrt(sum_sq / data_count) * 0.5
+    return rms_value > 0 and rms_factor * math.log(rms_value * spec_inv) or min_db
+end
+
+-- dB値を正規化してバーまたはテキストで描画
+local function draw_bar(db_value, draw_color, x_offset)
+    local norm_db = math.max(0, math.min(1, (db_value - min_db) * db_inv))
+    local bar_height = config.bar_height * norm_db
+    
+    if config.type_switch == 0 then
+        obj.load("figure", "四角形", draw_color, 1)
+        obj.drawpoly(
+            x_offset - half_width, -bar_height, 0,
+            x_offset + half_width, -bar_height, 0,
+            x_offset + half_width, 0, 0,
+            x_offset - half_width, 0, 0
+        )
+    else
+        local db_text = db_value <= min_db and min_text or string.format("%.1f %s", db_value, config.db_unit)
+        obj.setfont(config.text_font, config.text_size, 0, draw_color)
+        obj.load("text", db_text)
+        obj.draw(x_offset, -bar_height)
+    end
+end
+
+-- 表示タイプに応じて音声データを取得しメーターを描画
+local function draw_meter()
+    local meter_type = config.display_type
+    if meter_type == 1 then
+        obj.getaudio(left_data, "audiobuffer", "spectrum.l", config.sample_count)
+        obj.getaudio(right_data, "audiobuffer", "spectrum.r", config.sample_count)
+        draw_bar(calc_db(left_data, #left_data), config.left_color, -config.bar_spacing)
+        draw_bar(calc_db(right_data, #right_data), config.right_color, config.bar_spacing)
+    elseif meter_type == 4 then
+        obj.getaudio(left_data, "audiobuffer", "spectrum.l", config.sample_count)
+        obj.getaudio(right_data, "audiobuffer", "spectrum.r", config.sample_count)
+        draw_bar(calc_avg(left_data, right_data, #left_data), config.mono_color, 0)
+    else
+        local channel_spec = meter_type == 2 and "spectrum.l" or "spectrum.r"
+        local draw_color = meter_type == 2 and config.left_color or config.right_color
+        obj.getaudio(single_data, "audiobuffer", channel_spec, config.sample_count)
+        draw_bar(calc_db(single_data, #single_data), draw_color, 0)
+    end
+end
+
+local function main()
+    if config.type_switch == 0 then
+        obj.setoption("drawtarget", "tempbuffer", config.bar_width * 2 + config.bar_spacing * 2, config.bar_height * 2)
+    else
+        obj.setoption("drawtarget", "tempbuffer", config.bar_width * 2 + config.bar_spacing * 2 + config.text_size * 4, config.bar_height * 2 + config.text_size * 2) 
+    end
+    draw_meter()
+    obj.load("tempbuffer")
+end
+
+main()
+
+
+
+@SoundSync_Live
+--[[
+    音声同期（追従）です。
+    トラックバースクリプト内にある SoundSync_Live の参照元です。
+    音声同期用のパラメータを設定します。
+    音声波形を表示し、波形のバーを選択することにより、その周波数帯域にトラックバーの動きを同期することができます。
+    バーの上下とトラックバーの値の増減が連動します。
+    ガウス平滑化・周波数に応じた適応的平滑化・Catmull-Rom補間・時間方向平滑化を行い、波形を滑らかにします。
+    選択したバーの値には上端からの上限余白と下限高さによるクリッピング処理を行い、その最終的な値を soundsync_live_28.selected_value にグローバル変数として保存します。
+    チェックボックスから波形を非表示にすることも可能です。
+    ]]
+--track@start_freq:最小範囲,0,1023,0,1
+--track@end_freq:最大範囲,1,1024,128,1
+--track@split_count:分割数,1,256,32,1
+--track@select_bar:選択,1,256,8,1
+--track@upper_margin:上端値,0,1080,0,1
+--track@lower_height:下限値,0,1080,0,1
+--color@spectrum_color:色(波形),0x808080
+--color@selected_color:色(選択),0x02edaf
+--color@clipping_color:色(クリッピング),0x3d6359
+--check0:波形を消す,0
+--check1:0〜1の比率に変換,1
+
+-- 設定値
+local config = {
+    spectrum_scale       = 400000,                             -- 波形スケール
+    sigma_value          = 2.5,                                -- ガウス平滑化シグマ値
+    noise_threshold      = 0.01,                                -- ノイズゲート閾値
+    kernel_low           = 9,                                  -- 低周波カーネルサイズ
+    kernel_high          = 51,                                 -- 高周波カーネルサイズ
+    low_threshold        = 60,                                 -- 低周波閾値
+    high_threshold       = 100,                                -- 高周波閾値
+    interp_points        = 8,                                  -- 補間ポイント数
+    alpha_attack         = 0.85,                                -- 時間平滑化（立ち上がり）
+    alpha_release        = 0.70,                                -- 時間平滑化（減衰）
+    edge_padding         = 3,                                  -- エッジパディング幅
+    start_freq           = start_freq,                           -- 周波数範囲（開始）
+    end_freq             = end_freq,                             -- 周波数範囲（終了）
+    split_count          = split_count,                          -- バー分割数
+    draw_width           = 1024,                               -- 描画横幅
+    spectrum_color       = spectrum_color,                     -- スペクトラム色
+    bar_width            = 10,                                 -- バー太さ
+    bar_scale            = 4,                                  -- バー高さ倍率
+    screen_height        = obj.screen_h,                       -- 画面縦幅
+    center_y             = 0,                                  -- バー描画基点Y座標
+    select_bar           = math.min(select_bar, split_count),  -- 選択バー番号
+    selected_color       = selected_color,                     -- 選択バー色
+    upper_margin         = upper_margin,                         -- 上端からの上限余白
+    lower_height         = lower_height,                         -- 下限高さ
+    clipping_color       = clipping_color,                     -- クリッピング色
+    use_ratio            = obj.check1,                         -- 0〜1の比率に変換するか
+}
+
+-- 描画高さとクリッピング範囲を計算
+config.draw_height = config.screen_height * config.bar_scale / 4
+config.upper_margin = math.min(config.upper_margin, config.draw_height / 2)
+config.upper_height = math.max(0, config.draw_height / 2 - config.upper_margin)
+config.lower_height = math.min(config.lower_height, config.upper_height)
+
+-- 音声データ取得
+local audio_data = {}
+obj.getaudio(audio_data, "audiobuffer", "fourier", 1024)
+
+-- グローバル履歴を管理
+if not _G.spectrum_history_live then
+    _G.spectrum_history_live = {}
+end
+
+local stable_layer = math.floor((obj.layer or 0) + 0.5)
+local stable_index = math.floor((obj.index or 0) + 0.5)
+local history_key = "soundsync_live_" .. tostring(stable_layer) .. "_" .. tostring(stable_index)
+
+-- DC成分削除
+if #audio_data > 0 then
+    audio_data[1] = 0
+end
+
+-- ノイズゲート適用
+local max_value = 0
+for i = 1, #audio_data do
+    if audio_data[i] > max_value then
+        max_value = audio_data[i]
+    end
+end
+
+local noise_gate = max_value * config.noise_threshold
+for i = 1, #audio_data do
+    if audio_data[i] < noise_gate then
+        audio_data[i] = 0
+    end
+end
+
+-- 周波数範囲データを抽出
+local start_idx = math.max(1, math.min(config.start_freq + 1, #audio_data))
+local end_idx = math.max(start_idx, math.min(config.end_freq + 1, #audio_data))
+local audio_range = {}
+for i = start_idx, end_idx do
+    audio_range[#audio_range + 1] = audio_data[i]
+end
+local bin_count = #audio_range
+
+-- 履歴データを初期化
+local required_history_size = bin_count * config.interp_points
+local history_state = _G.spectrum_history_live[history_key]
+if
+    not history_state
+    or history_state.size ~= required_history_size
+    or history_state.bin_count ~= bin_count
+    or history_state.interp_points ~= config.interp_points
+    or obj.time == 0
+then
+    history_state = {
+        size = required_history_size,
+        bin_count = bin_count,
+        interp_points = config.interp_points,
+        values = {},
+    }
+    for i = 1, required_history_size do
+        history_state.values[i] = 0
+    end
+    _G.spectrum_history_live[history_key] = history_state
+end
+
+-- エッジパディング追加
+local function calc_fade(index, total_padding)
+    local ratio = (total_padding - index + 1) / total_padding
+    return math.exp(-3 * (1 - ratio))
+end
+
+local padded_audio = {}
+local padding_count = config.edge_padding
+
+-- 左側のパディング
+for i = 1, padding_count do
+    local fade_factor = calc_fade(i, padding_count)
+    local extrapolate = 0
+    if audio_range[2] and audio_range[1] then
+        local slope = audio_range[2] - audio_range[1]
+        extrapolate = audio_range[1] - slope * (padding_count - i + 1)
+        extrapolate = math.max(0, extrapolate)
+    end
+    table.insert(padded_audio, extrapolate * fade_factor)
+end
+
+-- 元のデータ
+for i = 1, #audio_range do
+    table.insert(padded_audio, audio_range[i])
+end
+
+-- 右側のパディング
+for i = 1, padding_count do
+    local fade_factor = calc_fade(i, padding_count)
+    local extrapolate = 0
+    if audio_range[#audio_range] and audio_range[#audio_range - 1] then
+        local slope = audio_range[#audio_range] - audio_range[#audio_range - 1]
+        extrapolate = audio_range[#audio_range] + slope * i
+        extrapolate = math.max(0, extrapolate)
+    end
+    table.insert(padded_audio, extrapolate * fade_factor)
+end
+
+-- カーネルを作成
+local function get_kernel(kernel_size, sigma_value)
+    local kernel_weights = {}
+    local total_sum = 0
+    local half_size = math.floor(kernel_size / 2)
+    for i = 1, kernel_size do
+        local x = i - half_size - 1
+        local weight = math.exp(-(x ^ 2) / (2 * sigma_value ^ 2))
+        kernel_weights[i] = weight
+        total_sum = total_sum + weight
+    end
+    for i = 1, kernel_size do
+        kernel_weights[i] = kernel_weights[i] / total_sum
+    end
+    return kernel_weights
+end
+
+-- ガウス平滑化を適用
+local function apply_smooth(data, kernel_size, sigma_value, center_idx)
+    local kernel_weights = get_kernel(kernel_size, sigma_value)
+    local half_size = math.floor(kernel_size / 2)
+    local total_sum = 0
+    for k = 1, kernel_size do
+        local data_idx = center_idx + k - half_size - 1
+        if data_idx >= 1 and data_idx <= #data then
+            total_sum = total_sum + data[data_idx] * kernel_weights[k]
+        end
+    end
+    return total_sum
+end
+
+-- 周波数に応じた適応的カーネルサイズ取得
+local function get_kernel_size(freq_index, config)
+    if bin_count <= 1 then
+        return config.kernel_low
+    end
+    local ratio = (freq_index - 1) / (bin_count - 1)
+    if ratio < config.low_threshold / 1024 then
+        return config.kernel_low
+    elseif ratio > config.high_threshold / 1024 then
+        return config.kernel_high
+    else
+        local smooth_ratio = (ratio - config.low_threshold / 1024) / ((config.high_threshold - config.low_threshold) / 1024)
+        local kernel_size = config.kernel_low + (config.kernel_high - config.kernel_low) * smooth_ratio
+        kernel_size = math.floor(kernel_size + 0.5)
+        if kernel_size % 2 == 0 then
+            kernel_size = kernel_size + 1
+        end
+        return kernel_size
+    end
+end
+
+-- 適応的ガウス平滑化を適用
+local smooth_data = {}
+for i = 1, bin_count do
+    local padded_index = padding_count + i
+    local kernel_size = get_kernel_size(i, config)
+    smooth_data[i] = apply_smooth(padded_audio, kernel_size, config.sigma_value, padded_index)
+end
+
+-- Catmull-Rom キュービック補間
+local function calc_cubic(p0, p1, p2, p3, t)
+    local t_squared = t * t
+    local t_cubed = t_squared * t
+    local tangent_0 = (p2 - p0) * 0.5
+    local tangent_1 = (p3 - p1) * 0.5
+    local hermite_00 = 2 * t_cubed - 3 * t_squared + 1
+    local hermite_10 = t_cubed - 2 * t_squared + t
+    local hermite_01 = -2 * t_cubed + 3 * t_squared
+    local hermite_11 = t_cubed - t_squared
+    return hermite_00 * p1 + hermite_10 * tangent_0 + hermite_01 * p2 + hermite_11 * tangent_1
+end
+
+-- 補間値を取得
+local function interpolate_value(spectrum, pos)
+    local spectrum_length = #spectrum
+    if spectrum_length == 0 then
+        return 0
+    end
+    if spectrum_length == 1 then
+        return spectrum[1] or 0
+    end
+
+    local lower_index = math.floor(pos)
+    local upper_index = math.min(lower_index + 1, spectrum_length)
+    lower_index = math.max(1, lower_index)
+    local interpolation_ratio = pos - lower_index
+
+    local p0 = spectrum[math.max(1, lower_index - 1)] or spectrum[lower_index] or 0
+    local p1 = spectrum[lower_index] or 0
+    local p2 = spectrum[upper_index] or 0
+    local p3 = spectrum[math.min(spectrum_length, upper_index + 1)] or spectrum[upper_index] or 0
+
+    return calc_cubic(p0, p1, p2, p3, interpolation_ratio)
+end
+
+-- 時間方向平滑化
+local final_data = {}
+for i = 1, required_history_size do
+    local pos = (i - 0.5) / config.interp_points + 0.5
+    local current = interpolate_value(smooth_data, pos)
+    local previous = history_state.values[i] or 0
+
+    local alpha
+    if current >= previous then
+        alpha = config.alpha_attack
+    else
+        alpha = config.alpha_release
+    end
+
+    local temporal_smooth = alpha * current + (1 - alpha) * previous
+    history_state.values[i] = temporal_smooth
+    final_data[i] = temporal_smooth
+end
+
+-- バー高さを計算
+local function calc_height(value, config)
+    local normalized = value / config.spectrum_scale
+    local bar_height = normalized * config.bar_scale * config.screen_height
+    return bar_height
+end
+
+-- バーの座標を計算
+local function calc_coords(x, bar_width, y_base, bar_height)
+    local x_left = x - bar_width / 2
+    local x_right = x + bar_width / 2
+    local y_top = y_base - bar_height
+    return x_left, x_right, y_top
+end
+
+-- バーを描画
+local function draw_bar(bar_params)
+    obj.load("figure", "四角形", bar_params.spectrum_color, 1)
+    obj.drawpoly(
+        bar_params.left_x, bar_params.base_y + 1, 0,
+        bar_params.right_x, bar_params.base_y + 1, 0,
+        bar_params.right_x, bar_params.top_y - 1, 0,
+        bar_params.left_x, bar_params.top_y - 1, 0
+    )
+end
+
+-- クリッピング範囲を描画
+local function draw_range(left_x, right_x, top_y, bottom_y, color)
+    obj.load("figure", "四角形", color, 1)
+    obj.drawpoly(
+        left_x, bottom_y, 0,
+        right_x, bottom_y, 0,
+        right_x, top_y, 0,
+        left_x, top_y, 0
+    )
+end
+
+-- 選択バーの値を集計
+local bar_values = {}
+local bar_count = math.max(1, config.split_count)
+if #final_data > 0 then
+    local bin_per_bar = #final_data / bar_count
+    for i = 1, bar_count do
+        local pos = (i - 0.5) * bin_per_bar + 0.5
+        bar_values[i] = interpolate_value(final_data, pos)
+    end
+else
+    for i = 1, bar_count do
+        bar_values[i] = 0
+    end
+end
+
+-- 選択されたバーの値にクリッピング処理を適用してグローバル変数へ保存
+local raw_value = bar_values[config.select_bar] or 0
+local raw_height = calc_height(raw_value, config)
+
+local clip_height = raw_height
+if raw_height <= config.lower_height then
+    clip_height = 0
+elseif raw_height >= config.upper_height then
+    clip_height = config.upper_height
+end
+
+local selected_value = clip_height / (config.bar_scale * config.screen_height) * config.spectrum_scale
+local object_value
+if config.use_ratio then
+    local clip_ratio = config.upper_height > 0 and clip_height / config.upper_height or 0
+    object_value = 1 + clip_ratio
+else
+    object_value = clip_height - config.center_y
+end
+
+soundsync_live_28 = {
+    bar_height = object_value,
+    selected_value = selected_value,
+    use_ratio = config.use_ratio,
+}
+
+-- スペクトラムバーを描画
+local function draw_bars(config, bar_values)
+    obj.setoption("drawtarget", "tempbuffer", config.draw_width, config.draw_height)
+
+    local bar_count = math.max(1, config.split_count)
+    local bar_width = math.min(config.bar_width, math.ceil(config.draw_width / bar_count) + 1)
+    local bar_step = config.draw_width / bar_count
+    local base_y = config.center_y
+
+    for i = 1, bar_count do
+        local interp_value = bar_values[i] or 0
+        local raw_bar_height = calc_height(interp_value, config)
+        local bar_height = raw_bar_height
+        if i == config.select_bar then
+            bar_height = math.min(bar_height, config.upper_height)
+        end
+        local center_x = bar_step * (i - 0.5) - config.draw_width / 2
+        local left_x, right_x, top_y = calc_coords(center_x, bar_width, base_y, bar_height)
+
+        local bar_color = config.spectrum_color
+        if i == config.select_bar then
+            bar_color = config.selected_color
+        end
+
+        local bar_params = {
+            left_x = left_x,
+            right_x = right_x,
+            base_y = base_y,
+            top_y = top_y,
+            spectrum_color = bar_color,
+        }
+        draw_bar(bar_params)
+
+        -- 選択バーのみクリッピング範囲を表示
+        if i == config.select_bar then
+            local clip_height = math.min(config.lower_height, bar_height)
+            local lower_y = config.center_y - clip_height
+            if lower_y < config.center_y then
+                draw_range(left_x, right_x, lower_y, config.center_y, config.clipping_color)
+            end
+
+            if raw_bar_height > config.upper_height then
+                local upper_clip_y = config.center_y - config.upper_height
+                local raw_top_y = config.center_y - raw_bar_height
+                draw_range(left_x, right_x, raw_top_y, upper_clip_y, config.clipping_color)
+            end
+        end
+    end
+end
+
+-- 波形描画モード
+local function draw_waveform()
+    draw_bars(config, bar_values)
+    obj.load("tempbuffer")
+end
+
+-- メイン処理
+local function main()
+    if not obj.check0 then
+        draw_waveform()
+    end
+end
+
+main()
+
+
+@SoundSync_Cumulative
+--[[
+    音声同期（累積）です。
+    トラックバースクリプト内にある SoundSync_Cumulative の参照元です。
+    音声同期用のパラメータを設定します。
+    音声波形を表示し、波形のバーを選択することにより、その周波数帯域にトラックバーの動きを同期することができます。
+    バーの上下とトラックバーの値の増減が連動するところまでは SoundSync_Live と同じですが、こちらは選択したバーの値を累積していきます。
+    その為、時間経過と共にトラックバーに渡される値が大きくなっていきます。
+    トラックバーの設定範囲内でループする様になっているので、範囲を超えた場合は最小値に戻ります。
+    選択したバーの値には上端からの上限余白と下限高さによるクリッピング処理を行い、クリッピング後の瞬間値を soundsync_cumulative_28.selected_value にグローバル変数として保存します。
+    チェックボックスから波形を非表示にすることも可能です。
+    ]]
+--track@start_freq:最小範囲,0,1023,0,1
+--track@end_freq:最大範囲,1,1024,128,1
+--track@split_count:分割数,1,256,32,1
+--track@select_bar:選択,1,256,8,1
+--track@upper_margin:上限値,0,1080,0,1
+--track@lower_height:下限値,0,1080,0,1
+--color@spectrum_color:色(波形),0x808080
+--color@selected_color:色(選択),0x02edaf
+--color@clipping_color:色(クリッピング),0x3d6359
+--check0:波形を消す,0
+--check1:0〜1の比率に変換,1
+
+-- 設定値
+local config = {
+    spectrum_scale       = 400000,                             -- 波形スケール
+    sigma_value          = 2.5,                                -- ガウス平滑化シグマ値
+    noise_threshold      = 0.01,                                -- ノイズゲート閾値
+    kernel_low           = 9,                                  -- 低周波カーネルサイズ
+    kernel_high          = 51,                                 -- 高周波カーネルサイズ
+    low_threshold        = 60,                                 -- 低周波閾値
+    high_threshold       = 100,                                -- 高周波閾値
+    interp_points        = 8,                                  -- 補間ポイント数
+    alpha_attack         = 0.85,                                -- 時間平滑化（立ち上がり）
+    alpha_release        = 0.70,                                -- 時間平滑化（減衰）
+    edge_padding         = 3,                                  -- エッジパディング幅
+    start_freq           = start_freq,                           -- 周波数範囲（開始）
+    end_freq             = end_freq,                             -- 周波数範囲（終了）
+    split_count          = split_count,                          -- バー分割数
+    draw_width           = 1024,                               -- 描画横幅
+    spectrum_color       = spectrum_color,                     -- スペクトラム色
+    bar_width            = 10,                                 -- バー太さ
+    bar_scale            = 4,                                  -- バー高さ倍率
+    screen_height        = obj.screen_h,                       -- 画面縦幅
+    center_y             = 0,                                  -- バー描画基点Y座標
+    select_bar           = math.min(select_bar, split_count),  -- 選択バー番号
+    selected_color       = selected_color,                     -- 選択バー色
+    upper_margin         = upper_margin,                         -- 上端からの上限余白
+    lower_height         = lower_height,                         -- 下限高さ
+    clipping_color       = clipping_color,                     -- クリッピング色
+    use_ratio            = obj.check1,                         -- 0〜1の比率に変換するか
+}
+
+-- 描画高さとクリッピング範囲を計算
+config.draw_height = config.screen_height * config.bar_scale / 4
+config.upper_margin = math.min(config.upper_margin, config.draw_height / 2)
+config.upper_height = math.max(0, config.draw_height / 2 - config.upper_margin)
+config.lower_height = math.min(config.lower_height, config.upper_height)
+
+-- 音声データ取得
+local audio_data = {}
+obj.getaudio(audio_data, "audiobuffer", "fourier", 1024)
+
+-- グローバル履歴を管理
+if not _G.spectrum_history_cumulative then
+    _G.spectrum_history_cumulative = {}
+end
+
+local stable_layer = math.floor((obj.layer or 0) + 0.5)
+local stable_index = math.floor((obj.index or 0) + 0.5)
+local history_key = "soundsync_cumulative_" .. tostring(stable_layer) .. "_" .. tostring(stable_index)
+
+-- DC成分削除
+if #audio_data > 0 then
+    audio_data[1] = 0
+end
+
+-- ノイズゲート適用
+local max_value = 0
+for i = 1, #audio_data do
+    if audio_data[i] > max_value then
+        max_value = audio_data[i]
+    end
+end
+
+local noise_gate = max_value * config.noise_threshold
+for i = 1, #audio_data do
+    if audio_data[i] < noise_gate then
+        audio_data[i] = 0
+    end
+end
+
+-- 周波数範囲データを抽出
+local start_idx = math.max(1, math.min(config.start_freq + 1, #audio_data))
+local end_idx = math.max(start_idx, math.min(config.end_freq + 1, #audio_data))
+local audio_range = {}
+for i = start_idx, end_idx do
+    audio_range[#audio_range + 1] = audio_data[i]
+end
+local bin_count = #audio_range
+
+-- 履歴データを初期化
+local required_history_size = bin_count * config.interp_points
+local history_state = _G.spectrum_history_cumulative[history_key]
+if
+    not history_state
+    or history_state.size ~= required_history_size
+    or history_state.bin_count ~= bin_count
+    or history_state.interp_points ~= config.interp_points
+    or obj.time == 0
+then
+    history_state = {
+        size = required_history_size,
+        bin_count = bin_count,
+        interp_points = config.interp_points,
+        values = {},
+    }
+    for i = 1, required_history_size do
+        history_state.values[i] = 0
+    end
+    _G.spectrum_history_cumulative[history_key] = history_state
+end
+
+-- エッジパディング追加
+local function calc_fade(index, total_padding)
+    local ratio = (total_padding - index + 1) / total_padding
+    return math.exp(-3 * (1 - ratio))
+end
+
+local padded_audio = {}
+local padding_count = config.edge_padding
+
+-- 左側のパディング
+for i = 1, padding_count do
+    local fade_factor = calc_fade(i, padding_count)
+    local extrapolate = 0
+    if audio_range[2] and audio_range[1] then
+        local slope = audio_range[2] - audio_range[1]
+        extrapolate = audio_range[1] - slope * (padding_count - i + 1)
+        extrapolate = math.max(0, extrapolate)
+    end
+    table.insert(padded_audio, extrapolate * fade_factor)
+end
+
+-- 元のデータ
+for i = 1, #audio_range do
+    table.insert(padded_audio, audio_range[i])
+end
+
+-- 右側のパディング
+for i = 1, padding_count do
+    local fade_factor = calc_fade(i, padding_count)
+    local extrapolate = 0
+    if audio_range[#audio_range] and audio_range[#audio_range - 1] then
+        local slope = audio_range[#audio_range] - audio_range[#audio_range - 1]
+        extrapolate = audio_range[#audio_range] + slope * i
+        extrapolate = math.max(0, extrapolate)
+    end
+    table.insert(padded_audio, extrapolate * fade_factor)
+end
+
+-- カーネルを作成
+local function get_kernel(kernel_size, sigma_value)
+    local kernel_weights = {}
+    local total_sum = 0
+    local half_size = math.floor(kernel_size / 2)
+    for i = 1, kernel_size do
+        local x = i - half_size - 1
+        local weight = math.exp(-(x ^ 2) / (2 * sigma_value ^ 2))
+        kernel_weights[i] = weight
+        total_sum = total_sum + weight
+    end
+    for i = 1, kernel_size do
+        kernel_weights[i] = kernel_weights[i] / total_sum
+    end
+    return kernel_weights
+end
+
+-- ガウス平滑化を適用
+local function apply_smooth(data, kernel_size, sigma_value, center_idx)
+    local kernel_weights = get_kernel(kernel_size, sigma_value)
+    local half_size = math.floor(kernel_size / 2)
+    local total_sum = 0
+    for k = 1, kernel_size do
+        local data_idx = center_idx + k - half_size - 1
+        if data_idx >= 1 and data_idx <= #data then
+            total_sum = total_sum + data[data_idx] * kernel_weights[k]
+        end
+    end
+    return total_sum
+end
+
+-- 周波数に応じた適応的カーネルサイズ取得
+local function get_kernel_size(freq_index, config)
+    if bin_count <= 1 then
+        return config.kernel_low
+    end
+    local ratio = (freq_index - 1) / (bin_count - 1)
+    if ratio < config.low_threshold / 1024 then
+        return config.kernel_low
+    elseif ratio > config.high_threshold / 1024 then
+        return config.kernel_high
+    else
+        local smooth_ratio = (ratio - config.low_threshold / 1024) / ((config.high_threshold - config.low_threshold) / 1024)
+        local kernel_size = config.kernel_low + (config.kernel_high - config.kernel_low) * smooth_ratio
+        kernel_size = math.floor(kernel_size + 0.5)
+        if kernel_size % 2 == 0 then
+            kernel_size = kernel_size + 1
+        end
+        return kernel_size
+    end
+end
+
+-- 適応的ガウス平滑化を適用
+local smooth_data = {}
+for i = 1, bin_count do
+    local padded_index = padding_count + i
+    local kernel_size = get_kernel_size(i, config)
+    smooth_data[i] = apply_smooth(padded_audio, kernel_size, config.sigma_value, padded_index)
+end
+
+-- Catmull-Rom キュービック補間
+local function calc_cubic(p0, p1, p2, p3, t)
+    local t_squared = t * t
+    local t_cubed = t_squared * t
+    local tangent_0 = (p2 - p0) * 0.5
+    local tangent_1 = (p3 - p1) * 0.5
+    local hermite_00 = 2 * t_cubed - 3 * t_squared + 1
+    local hermite_10 = t_cubed - 2 * t_squared + t
+    local hermite_01 = -2 * t_cubed + 3 * t_squared
+    local hermite_11 = t_cubed - t_squared
+    return hermite_00 * p1 + hermite_10 * tangent_0 + hermite_01 * p2 + hermite_11 * tangent_1
+end
+
+-- 補間値を取得
+local function interpolate_value(spectrum, pos)
+    local spectrum_length = #spectrum
+    if spectrum_length == 0 then
+        return 0
+    end
+    if spectrum_length == 1 then
+        return spectrum[1] or 0
+    end
+
+    local lower_index = math.floor(pos)
+    local upper_index = math.min(lower_index + 1, spectrum_length)
+    lower_index = math.max(1, lower_index)
+    local interpolation_ratio = pos - lower_index
+
+    local p0 = spectrum[math.max(1, lower_index - 1)] or spectrum[lower_index] or 0
+    local p1 = spectrum[lower_index] or 0
+    local p2 = spectrum[upper_index] or 0
+    local p3 = spectrum[math.min(spectrum_length, upper_index + 1)] or spectrum[upper_index] or 0
+
+    return calc_cubic(p0, p1, p2, p3, interpolation_ratio)
+end
+
+-- 時間方向平滑化
+local final_data = {}
+for i = 1, required_history_size do
+    local pos = (i - 0.5) / config.interp_points + 0.5
+    local current = interpolate_value(smooth_data, pos)
+    local previous = history_state.values[i] or 0
+
+    local alpha
+    if current >= previous then
+        alpha = config.alpha_attack
+    else
+        alpha = config.alpha_release
+    end
+
+    local temporal_smooth = alpha * current + (1 - alpha) * previous
+    history_state.values[i] = temporal_smooth
+    final_data[i] = temporal_smooth
+end
+
+-- バー高さを計算
+local function calc_height(value, config)
+    local normalized = value / config.spectrum_scale
+    local bar_height = normalized * config.bar_scale * config.screen_height
+    return bar_height
+end
+
+-- バーの座標を計算
+local function calc_coords(x, bar_width, y_base, bar_height)
+    local x_left = x - bar_width / 2
+    local x_right = x + bar_width / 2
+    local y_top = y_base - bar_height
+    return x_left, x_right, y_top
+end
+
+-- バーを描画
+local function draw_bar(bar_params)
+    obj.load("figure", "四角形", bar_params.spectrum_color, 1)
+    obj.drawpoly(
+        bar_params.left_x, bar_params.base_y + 1, 0,
+        bar_params.right_x, bar_params.base_y + 1, 0,
+        bar_params.right_x, bar_params.top_y - 1, 0,
+        bar_params.left_x, bar_params.top_y - 1, 0
+    )
+end
+
+-- クリッピング範囲を描画
+local function draw_range(left_x, right_x, top_y, bottom_y, color)
+    obj.load("figure", "四角形", color, 1)
+    obj.drawpoly(
+        left_x, bottom_y, 0,
+        right_x, bottom_y, 0,
+        right_x, top_y, 0,
+        left_x, top_y, 0
+    )
+end
+
+-- 選択バーの値を集計
+local bar_values = {}
+local bar_count = math.max(1, config.split_count)
+if #final_data > 0 then
+    local bin_per_bar = #final_data / bar_count
+    for i = 1, bar_count do
+        local pos = (i - 0.5) * bin_per_bar + 0.5
+        bar_values[i] = interpolate_value(final_data, pos)
+    end
+else
+    for i = 1, bar_count do
+        bar_values[i] = 0
+    end
+end
+
+-- 選択されたバーの値にクリッピング処理を適用
+local raw_value = bar_values[config.select_bar] or 0
+local raw_height = calc_height(raw_value, config)
+
+local clip_height = raw_height
+if raw_height <= config.lower_height then
+    clip_height = 0
+elseif raw_height >= config.upper_height then
+    clip_height = config.upper_height
+end
+
+local selected_value = clip_height / (config.bar_scale * config.screen_height) * config.spectrum_scale
+local delta_value
+if config.use_ratio then
+    local clip_ratio = config.upper_height > 0 and clip_height / config.upper_height or 0
+    delta_value = clip_ratio
+else
+    delta_value = clip_height - config.center_y
+end
+
+-- フレーム別の累積計算用グローバルテーブル
+if not _G.frame_cumulative_data then
+    _G.frame_cumulative_data = {}
+end
+
+local frame_key = "frame_cumulative_" .. tostring(stable_layer) .. "_" .. tostring(stable_index)
+if not _G.frame_cumulative_data[frame_key] then
+    _G.frame_cumulative_data[frame_key] = {}
+end
+
+-- 選択されたバーの値を累積してグローバル変数へ保存
+local current_frame = math.floor((obj.frame or 0) + 0.5)
+if current_frame < 0 then
+    current_frame = 0
+end
+
+local frame_state = _G.frame_cumulative_data[frame_key]
+local accumulated_height
+if type(frame_state.last_frame) == "number" and type(frame_state.last_value) == "number" then
+    if current_frame == frame_state.last_frame then
+        accumulated_height = frame_state.last_value
+    elseif current_frame == frame_state.last_frame + 1 then
+        accumulated_height = frame_state.last_value + delta_value
+    else
+        -- 逆再生・シーク・ジャンプ時は安全のため再スタート
+        accumulated_height = delta_value
+    end
+else
+    accumulated_height = delta_value
+end
+
+frame_state.last_frame = current_frame
+frame_state.last_value = accumulated_height
+
+soundsync_cumulative_28 = {
+    bar_height = accumulated_height,
+    selected_value = selected_value,
+    use_ratio = config.use_ratio,
+}
+
+-- スペクトラムバーを描画
+local function draw_bars(config, bar_values)
+    obj.setoption("drawtarget", "tempbuffer", config.draw_width, config.draw_height)
+
+    local bar_count = math.max(1, config.split_count)
+    local bar_width = math.min(config.bar_width, math.ceil(config.draw_width / bar_count) + 1)
+    local bar_step = config.draw_width / bar_count
+    local base_y = config.center_y
+
+    for i = 1, bar_count do
+        local interp_value = bar_values[i] or 0
+        local raw_bar_height = calc_height(interp_value, config)
+        local bar_height = raw_bar_height
+        if i == config.select_bar then
+            bar_height = math.min(bar_height, config.upper_height)
+        end
+        local center_x = bar_step * (i - 0.5) - config.draw_width / 2
+        local left_x, right_x, top_y = calc_coords(center_x, bar_width, base_y, bar_height)
+
+        local bar_color = config.spectrum_color
+        if i == config.select_bar then
+            bar_color = config.selected_color
+        end
+
+        local bar_params = {
+            left_x = left_x,
+            right_x = right_x,
+            base_y = base_y,
+            top_y = top_y,
+            spectrum_color = bar_color,
+        }
+        draw_bar(bar_params)
+
+        -- 選択バーのみクリッピング範囲を表示
+        if i == config.select_bar then
+            local clip_height = math.min(config.lower_height, bar_height)
+            local lower_y = config.center_y - clip_height
+            if lower_y < config.center_y then
+                draw_range(left_x, right_x, lower_y, config.center_y, config.clipping_color)
+            end
+
+            if raw_bar_height > config.upper_height then
+                local upper_clip_y = config.center_y - config.upper_height
+                local raw_top_y = config.center_y - raw_bar_height
+                draw_range(left_x, right_x, raw_top_y, upper_clip_y, config.clipping_color)
+            end
+        end
+    end
+end
+
+-- 波形描画モード
+local function draw_waveform()
+    draw_bars(config, bar_values)
+    obj.load("tempbuffer")
+end
+
+-- メイン処理
+local function main()
+    if not obj.check0 then
+        draw_waveform()
+    end
+end
+
+main()
+
+
+
+
+
+@StereoImager
+--[[
+    ステレオイメージャーです。
+    obj.getaudio() で取得した L/R の値を X/Y 座標に変換して描画しています(厳密には45度Z軸回転させてます)。
+    変化量100が基準ですが、ASMR など音量が小さいと点がほとんど動かないので適当に調整してください。
+    枠の範囲を上限に設定している為、変化量をでかくしすぎるとクリッピングされます。
+    左右差を見ているので、モノラル音声だと点が左右に広がりません。また、パンを振ると点が偏ります。
+    分割数を増やすと見やすくなりますが、その分重くなります。
+]]
+--track@obj_size:サイズ,0,1024,512,1
+--track@point_count:点の数,0,1024,256,1
+--track@point_size:点サイズ,0,16,2,0.1
+--track@amount_scale:変化量,1,200,100,1
+--track@cross_line:基線太さ,0,32,1,1
+--track@frame_line:枠線太さ,0,32,2,1
+--color@point_color:色(点),0x02edaf
+--color@frame_color:色(枠),0x808080
+--color@cross_color:色(基線),0x808080
+--check@cross_bar:基線表示,1
+--check@frame_bar:枠表示,1
+--figure@figure_type:図形,円
+
+
+-- 各種設定値
+local config = {
+    -- 点
+    sqrt2_div2      = math.sqrt(2) / 2,     -- 45度なので、sinもcosも√2/2
+    obj_size        = obj_size,             -- サイズ
+    point_count     = point_count,          -- 点の数
+    point_size      = point_size,           -- 点サイズ
+    amount_scale    = amount_scale / 100,  -- 変化量
+    color           = point_color,          -- 点の色
+    figure_type     = figure_type,          -- 図形
+
+    -- 枠線
+    cross_bar       = cross_bar,            -- 基線表示
+    frame_bar       = frame_bar,            -- 枠表示
+    cross_color     = cross_color,          -- 線の色
+    frame_color     = frame_color,          -- 枠線の色
+    cross_line      = cross_line,           -- 基線太さ
+    frame_line      = frame_line,           -- 枠線太さ
+    alpha_value     = 1,                    -- 枠線と基線の透明度
+}
+
+
+local left_data, right_data = {}, {}
+obj.getaudio(left_data, "audiobuffer", "pcm.l", 1024)
+obj.getaudio(right_data, "audiobuffer", "pcm.r", 1024)
+local bin_count = #left_data
+
+local function limit_value(value, min_limit, max_limit)
+    if value < min_limit then return min_limit end
+    if value > max_limit then return max_limit end
+    return value
+end
+
+local function rotate_position(x_value, y_value, cos_value, sin_value)
+    return x_value * cos_value - y_value * sin_value, x_value * sin_value + y_value * cos_value
+end
+
+local function draw_frame(radius_value)
+    obj.load("figure", "四角形", config.frame_color, radius_value * 2, config.frame_line * 2)
+    obj.draw(
+    0, 0, 0,
+    1, config.alpha_value,
+    0, 0, 45)
+end
+
+local function draw_cross(radius_value, cross_value)
+    local function draw_line(xa, ya, xb, yb)
+        local x1, y1 = rotate_position(xa, ya, config.sqrt2_div2, config.sqrt2_div2)
+        local x2, y2 = rotate_position(xb, ya, config.sqrt2_div2, config.sqrt2_div2)
+        local x3, y3 = rotate_position(xb, yb, config.sqrt2_div2, config.sqrt2_div2)
+        local x4, y4 = rotate_position(xa, yb, config.sqrt2_div2, config.sqrt2_div2)
+        obj.drawpoly(
+        x1, y1, 0,
+        x2, y2, 0,
+        x3, y3, 0,
+        x4, y4, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        config.alpha_value
+    )
+    end
+    obj.load("figure", "四角形", config.cross_color, 1)
+    draw_line(radius_value, cross_value, -radius_value, -cross_value)
+    draw_line(cross_value, radius_value, -cross_value, -radius_value)
+end
+
+
+local function draw_point(point, config)
+    local left_value = point.left_value
+    local right_value = point.right_value
+    local x_value = left_value / 190 * config.amount_scale * config.obj_size / 500
+    local y_value = right_value / 190 * config.amount_scale * config.obj_size / 500
+
+    local max_radius = config.obj_size / 2 * config.sqrt2_div2
+    x_value = limit_value(x_value, -max_radius, max_radius)
+    y_value = limit_value(y_value, -max_radius, max_radius)
+    local x_value, y_value = rotate_position(x_value, y_value, config.sqrt2_div2, config.sqrt2_div2)
+
+    obj.load("figure", config.figure_type, config.color)
+    obj.drawpoly(
+    x_value - config.point_size, y_value - config.point_size, 0,
+    x_value + config.point_size, y_value - config.point_size, 0,
+    x_value + config.point_size, y_value + config.point_size, 0,
+    x_value - config.point_size, y_value + config.point_size, 0
+    )
+end
+
+local function main(config)
+    obj.setoption("drawtarget","tempbuffer", config.obj_size, config.obj_size)
+    local point_count = config.point_count
+    local radius_value = config.obj_size / 2 * config.sqrt2_div2
+    for i = 1, point_count do
+        local buffer_pos = 1 + (i - 1) * (bin_count - 1) / point_count
+        local buffer_idx = math.floor(buffer_pos)
+        local left_value = left_data[buffer_idx] or 0
+        local right_value = right_data[buffer_idx] or 0
+        local point = {
+            left_value = left_value,
+            right_value = right_value,
+            color = config.color,
+        }
+        draw_point(point, config)
+    end
+    -- 十字基線
+    if config.cross_bar == 1 then
+        draw_cross(radius_value, config.cross_line)
+    end
+    -- 菱形枠線
+    if config.frame_bar == 1 then
+        draw_frame(radius_value)
+    end
+    obj.load("tempbuffer")
+end
+
+main(config)
+
+@PlayBar
+--[[
+    再生バーです。
+    カスタムオブジェクトの長さに応じて再生バーを描画します。カスタムオブジェクトの長さ = 総再生時間です。
+    再生前、再生後でそれぞれ色を変えることができます。
+    図形を変更すると再生位置を示すマーカーの形状が変わります。円にして『図形上下』を0にすると Youtube っぽくなるんじゃないでしょうか。
+    ]]
+--track@bar_height:縦幅,0,1080,5,0.1
+--track@bar_width:横幅,0,1920,1024,0.1
+--track@marker_size:サイズ,0,256,16,1
+--track@marker_offset:図形上下,-1080,1080,-32,0.1
+--track@shape_angle:回転,0,360,180,1
+--color@color_before:色(再生済),0x02edaf
+--color@color_after:色(再生前),0x808080
+--color@color_marker:色(図形),0x02edaf
+--figure@marker_shape:図形タイプ,三角形
+--check@show_before:表示(前),1
+--check@show_after:表示(後),1
+--check@play_marker:表示(図形),1
+
+-- 設定値まとめ
+local config = {
+    -- 全体
+    bar_height    = bar_height,                 -- バー縦幅
+    bar_width     = bar_width,                   -- バー横幅
+    marker_size   = marker_size,                 -- マーカー図形サイズ
+    marker_offset = marker_offset,               -- マーカーYオフセット
+    current_time  = obj.time,                 -- 現在再生時間
+    total_time    = obj.totaltime,            -- 総再生時間
+
+    -- 再生バー
+    show_before   = show_before,              -- 再生済みバー表示フラグ
+    show_after    = show_after,               -- 未再生バー表示フラグ
+    color_before  = color_before, -- 未再生バー色
+    color_after   = color_after,  -- 再生済みバー色
+
+    -- マーカー
+    show_marker   = play_marker,              -- 再生位置マーカー表示フラグ
+    color_marker  = color_marker, -- マーカー色
+    shape_type    = marker_shape, -- マーカー図形タイプ
+    shape_angle   = shape_angle,       -- マーカー回転角
+}
+
+local function draw_bar(param)
+    obj.load("figure", "四角形", param.color, 2)
+    obj.drawpoly(
+        param.left_x, -param.bar_height, 0,
+        param.right_x, -param.bar_height, 0,
+        param.right_x,  param.bar_height, 0,
+        param.left_x,  param.bar_height, 0
+    )
+end
+
+local function draw_marker(param)
+    obj.load("figure", param.shape, param.color, param.size)
+    obj.draw(param.x, param.y, 0, 1, 1, 0, 0, param.angle)
+end
+
+local function progress_rate()
+    if config.total_time == 0 then return 0 end
+    return config.current_time / config.total_time
+end
+
+local function draw_param()
+    local rate = progress_rate()
+    local half_height = config.bar_height / 2
+    local half_width  = config.bar_width / 2
+    local left_x = -half_width
+    local right_x = half_width
+    local played_x = left_x + config.bar_width * rate
+    local buffer_w = math.ceil(math.max(half_width, config.marker_size / 2) * 2 + config.marker_size)
+    local buffer_h = math.ceil(math.max(half_height, config.marker_size / 2) * 2 + math.abs(config.marker_offset) * 2 + 2)
+    return {
+        bar_before = {
+            left_x = left_x,
+            right_x = played_x,
+            bar_height = half_height,
+            color = config.color_before
+        },
+        bar_after  = {
+            left_x = played_x,
+            right_x = right_x,
+            bar_height = half_height,
+            color = config.color_after
+        },
+        marker     = {
+            x = played_x,
+            y = config.marker_offset,
+            color = config.color_marker,
+            size = config.marker_size,
+            shape = config.shape_type,
+            angle = config.shape_angle
+        },
+        buffer_w = buffer_w,
+        buffer_h = buffer_h
+    }
+end
+
+local function main()
+    local param = draw_param()
+    obj.setoption("drawtarget", "tempbuffer", param.buffer_w, param.buffer_h)
+    if config.show_before == 1 then
+        draw_bar(param.bar_before)
+    end
+    if config.show_after == 1 then
+        draw_bar(param.bar_after)
+    end
+    if config.show_marker == 1 then
+        draw_marker(param.marker)
+    end
+    obj.load("tempbuffer")
+end
+
+main()
+
+@PlayTime
+--[[
+    再生秒数表示です。
+    カスタムオブジェクトの長さに応じて再生時間を表示します。総再生時間 = カスタムオブジェクトの長さです。
+    再生前、再生後でそれぞれ色・形状を変えることができます。
+    > 前：経過時間 or 0秒固定
+    > 後：残り時間 or 総再生時間
+    秒数は基本 mm:ss 形式で表示されますが、オブジェクトの長さが1時間を超えると自動で hh:mm:ss 形式で表示されます。
+    この Script で 24時間以上の動画を作ることはないと思うので対応してません。必要に応じて改造してください。
+    ]]
+--track@text_height:縦幅,0,900,5,1
+--track@bar_width:横幅,0,1600,1140,0.1
+--track@text_size:サイズ,0,100,32,1
+--color@color_text:色,0x02edaf
+--font@font_name:フォント,游ゴシック
+--check@show_before:表示(前),1
+--check@show_after:表示(後),1
+--check@before_type:表示形式(前),0
+--check@after_type:表示形式(後),0
+--dialog:区切り,local split_type=":";
+
+-- 設定値
+local config = {
+    bar_width       = bar_width,         -- バー横幅
+    text_size       = text_size,         -- テキストサイズ
+    current_time    = obj.time,         -- 現在再生時間
+    total_time      = obj.totaltime,    -- トータル再生時間
+    font_name       = font_name,        -- フォント名
+    font_color      = color_text,       -- フォント色
+    show_before     = show_before,      -- 前時間表示フラグ
+    show_after      = show_after,       -- 後時間表示フラグ
+    before_type     = before_type,      -- 前時間表示形式
+    after_type      = after_type,       -- 後時間表示形式
+    split_type      = split_type,       -- 区切り文字
+    max_sec         = 6000,             -- 最大秒数
+    sec_per_min     = 60,               -- 1分あたり秒数
+    sec_per_hour    = 3600,             -- 1時間あたり秒数
+    sec_per_day     = 86400,            -- 1日あたり秒数
+}
+
+local function time_format(sec, all_sec)
+    local elapsed_sec = sec
+    -- トータルの再生時間が1時間以上の再生時間の場合はhh:mm:ss形式
+    if all_sec > config.sec_per_hour then
+        elapsed_sec = elapsed_sec % config.sec_per_day
+        return string.format(
+        "%02d" .. config.split_type .. "%02d" .. config.split_type .. "%02d",
+        elapsed_sec / config.sec_per_hour,
+        (elapsed_sec / config.sec_per_min) % config.sec_per_min,
+        elapsed_sec % config.sec_per_min
+    )
+    else
+        elapsed_sec = elapsed_sec % config.max_sec
+        return string.format(
+        "%02d" .. config.split_type .. "%02d",
+        elapsed_sec / config.sec_per_min,
+        elapsed_sec % config.sec_per_min
+        )
+    end
+end
+
+local function time_draw(text, pos_x)
+    obj.load("text", text)
+    obj.draw(pos_x)
+end
+
+local function main()
+    local current_time_floored = math.floor(config.current_time)
+    local total_time_floored = math.floor(config.total_time)
+    
+    obj.setoption("drawtarget", "tempbuffer", config.bar_width + config.text_size * 5, config.text_size * 2)
+    obj.setfont(config.font_name, config.text_size, 0, config.font_color)
+    if config.show_before == 1 then
+        local before_sec
+        if config.before_type == 0 then
+            before_sec = current_time_floored
+        else
+            before_sec = 0
+        end
+        local text = time_format(before_sec, total_time_floored)
+        local pos = -config.bar_width / 2
+        time_draw(text, pos)
+    end
+    if config.show_after == 1 then
+        local after_sec
+        if config.after_type == 0 then
+            after_sec = total_time_floored - current_time_floored
+        else
+            after_sec = total_time_floored
+        end
+        local text = time_format(after_sec, total_time_floored)
+        local pos = config.bar_width / 2
+        time_draw(text, pos)
+    end
+    obj.load("tempbuffer")
+end
+
+main()
+
+
+@TimeSignature
+--[[
+    拍子表示です。
+    指定した BPM に合わせて、指定された拍子を表示します。
+    中間点を打つと拍子がリセットされます。
+    変拍子など、途中で拍子や BPM を変更したい場合は移動方法を『瞬間移動』にしてください。それ以外の方法では正しく動作しません。
+    その為、BPM にオートメーションを掛けて経時的に変化する様な曲には対応していません。必要に応じて改造してください。
+    表示形式は
+    > 1：分子(可変)/分母(可変)
+    > 2：分子(可変)/定数
+    > 3：定数/定数
+    > 4：分子(可変)
+    > 5：分母(可変)
+    > 6：BPM
+    です。必要に応じて切り替えてください。
+    分数表記に使う括線はデフォルトで『/』が指定されていますが、ダイアログで変更が可能です。
+]]
+--track@beat_numerator:分子,1,16,4,1
+--track@beat_denominator:分母,2,16,4,1
+--track@bpm_value:BPM,1,8192,128,1
+--select@format_type:表示形式=1,分子/分母=1,分子/定数=2,定数/定数=3,分子のみ=4,分母のみ=5,BPM=6
+--track@numerator_size:分子サイズ,16,4096,64,1
+--track@denominator_size:分母サイズ,16,4096,64,1
+--track@letter_spacing:字間,0,4096,0,1
+--color@text_color:色,0x02edaf
+--font@text_font:フォント,游ゴシック
+--group:イージング,false
+--separator:『EasingReceptor』が導入されていない場合は使えません
+--track@easing_id:軌道番号,0,100,1,1
+--select@easing_size:イージング(大きさ),無し=0,有り(登場)=1,有り(登退場)=2,
+--select@easing_y:イージング(Y軸),無し=0,有り(登場)=1,有り(登退場)=2,
+--group
+--dialog:括線,local vinculum_type="/";
+--separator:MIDIを読み込むと拍子とBPMがMIDI依存になります
+--file@file:MIDIファイル
+
+--hide@easing_size:
+
+local midi_data = nil
+if file and file ~= "" then
+    local module_loaded, midi_module = pcall(require, "MIDI_for_AviUtl")
+    local midi_dll = module_loaded and obj.module("MIDI_module")
+    if not module_loaded or not midi_module or not midi_dll then
+        obj.setfont("", 64, 1, 0xffffff, 0x000000)
+        obj.load("text", "MIDI_for_AviUtl.luaまたはMIDI_module.mod2が見つかりません。\n" .. tostring(midi_module))
+        obj.draw()
+        return
+    end
+
+    local file_loaded
+    file_loaded, midi_data = pcall(midi_module.load, midi_dll, file)
+    if not file_loaded or not midi_data then
+        obj.setfont("", 64, 1, 0xffffff, 0x000000)
+        obj.load("text", "MIDIファイルの読み込みに失敗しました。\n" .. tostring(midi_data))
+        obj.draw()
+        return
+    end
+end
+
+-- 設定値
+local config = {
+    beat_numerator    = beat_numerator,         -- 拍子分子
+    beat_denominator  = beat_denominator,       -- 拍子分母
+    bpm_value         = bpm_value,             -- BPM値
+    format_type       = format_type,                -- 表示形式
+    current_time      = obj.time,                   -- 現在時刻
+    vinculum_type     = vinculum_type or "/",       -- 括線種類
+    numerator_size    = numerator_size,       -- 分子サイズ
+    denominator_size  = denominator_size,     -- 分母サイズ
+    letter_spacing    = letter_spacing,       -- 字間
+    text_color        = text_color,                 -- テキスト色
+    text_font         = text_font,                  -- テキストフォント
+
+    easing_id          = easing_id,              -- 軌道番号
+    easing_size        = easing_size,            -- イージング(大きさ)
+    easing_y           = easing_y,               -- イージング(Y軸)
+    y_offset           = 25,               -- Yオフセット
+}
+
+local function find_value(events, current_tick, default_value)
+    local current_value = default_value
+    for _, event_data in ipairs(events or {}) do
+        if event_data.tick > current_tick then
+            break
+        end
+        current_value = event_data
+    end
+    return current_value
+end
+
+local function midi_values(midi)
+    if not midi then
+        return config.beat_numerator, config.beat_denominator, config.bpm_value
+    end
+
+    local current_tick = midi:TimeToTick(config.current_time)
+    local time_signature = find_value(midi.timesigs, current_tick, {
+        numerator = config.beat_numerator,
+        denominator = config.beat_denominator,
+    })
+    local tempo_event = find_value(midi.tempos, current_tick, {
+        microsec = 60000000 / config.bpm_value,
+    })
+    local bpm_value = 60000000 / tempo_event.microsec
+    return time_signature.numerator, bpm_value
+end
+    if midi_data then
+        local initial_signature = find_value(midi_data.timesigs, 0, nil)
+        if initial_signature then
+            config.beat_denominator = initial_signature.denominator
+        end
+    end
+
+-- obj.getpoint の代用
+local function get_section()
+    local section_num = obj.getoption("section_num")
+    for section_index = section_num, 0, -1 do
+        if obj.getvalue("time", 0, section_index) <= config.current_time then
+            return section_index
+        end
+    end
+    return 0
+end
+
+local function ease_value(ratio)
+    if config.easing_id > 0 and _G.easing_eval_28 then
+        return _G.easing_eval_28(config.easing_id, ratio)
+    end
+    return ratio
+end
+
+local function get_ratio(mode, elapsed_time, duration_time, beat_time)
+    if mode == 0 or config.easing_id <= 0 then
+        return 1
+    end
+
+    local progress_ratio
+    if mode == 1 then
+        progress_ratio = math.max(0, math.min(1, elapsed_time / duration_time))
+        return ease_value(progress_ratio)
+    elseif mode == 2 then
+        if elapsed_time < duration_time then
+            progress_ratio = math.max(0, math.min(1, elapsed_time / duration_time))
+            return ease_value(progress_ratio)
+        end
+        progress_ratio = math.max(0, math.min(1, (elapsed_time - duration_time) / beat_time))
+        return 1 - ease_value(progress_ratio)
+    end
+
+    return 1
+end
+
+local function draw_text(text, position_x, position_y, text_size, scale_ratio, alpha_ratio)
+    alpha_ratio = alpha_ratio or 1
+    if scale_ratio <= 0 or alpha_ratio <= 0 then return end
+    obj.setfont(config.text_font, text_size, 0, config.text_color)
+    obj.load("text", text)
+    obj.draw(position_x, position_y, 0, scale_ratio, alpha_ratio)
+end
+
+local function draw_part(current_text, previous_text, position_x, text_size, elapsed_time, duration_time, beat_time, is_switch)
+    if not is_switch then
+        draw_text(current_text, position_x, 0, text_size, 1, 1)
+        return
+    end
+
+    local size_ratio = get_ratio(config.easing_size, elapsed_time, duration_time, beat_time)
+    local y_ratio = get_ratio(config.easing_y, elapsed_time, duration_time, beat_time)
+    local current_y = -config.y_offset * (1 - y_ratio)
+
+    if config.easing_size == 2 or config.easing_y == 2 then
+        local previous_size = get_ratio(config.easing_size, duration_time + elapsed_time, duration_time, beat_time)
+        local previous_y_ratio = get_ratio(config.easing_y, duration_time + elapsed_time, duration_time, beat_time)
+        local previous_y = config.y_offset * (1 - previous_y_ratio)
+        draw_text(previous_text, position_x, previous_y, text_size, previous_size, previous_y_ratio)
+    end
+
+    draw_text(current_text, position_x, current_y, text_size, size_ratio, y_ratio)
+end
+
+local function draw_signature(numerator_text, denominator_text, numerator_elapsed, beat_time, denominator_switch)
+    local max_size = math.max(config.numerator_size, config.denominator_size)
+    local text_spacing = max_size * 0.5 + config.letter_spacing
+    local numerator_duration = beat_time
+    draw_part(
+        numerator_text.current, numerator_text.previous, -text_spacing, config.numerator_size,
+        numerator_elapsed, numerator_duration, beat_time, true
+    )
+    draw_part(
+        denominator_text.current, denominator_text.previous, text_spacing, config.denominator_size,
+        numerator_elapsed, numerator_duration, beat_time, denominator_switch
+    )
+    draw_text(config.vinculum_type, 0, 0, config.denominator_size, 1, 1)
+end
+
+local function tick_time(midi, target_tick)
+    local elapsed_time = 0
+    local previous_tick = 0
+    local previous_tempo = midi.tempos[1].microsec
+    for _, tempo_event in ipairs(midi.tempos) do
+        if tempo_event.tick > target_tick then break end
+        elapsed_time = elapsed_time + (tempo_event.tick - previous_tick) * previous_tempo / midi.tick_quarter / 1000000
+        previous_tick = tempo_event.tick
+        previous_tempo = tempo_event.microsec
+    end
+    if target_tick > previous_tick then
+        elapsed_time = elapsed_time + (target_tick - previous_tick) * previous_tempo / midi.tick_quarter / 1000000
+    end
+    return elapsed_time
+end
+
+local function calc_beat()
+    if midi_data then
+        local current_tick = midi_data:TimeToTick(config.current_time)
+        local beat_starts = midi_data:GetBeatStarts()
+        local beat_index = 1
+        for index, beat_start in ipairs(beat_starts) do
+            if beat_start > current_tick then break end
+            beat_index = index
+        end
+        local signature_index = 1
+        for index, signature_data in ipairs(midi_data.timesigs) do
+            if signature_data.tick > current_tick then break end
+            signature_index = index
+        end
+        local signature_data = midi_data.timesigs[signature_index]
+        local signature_beat = 1
+        for index = beat_index, 1, -1 do
+            if beat_starts[index] < signature_data.tick then break end
+            signature_beat = index
+        end
+        local current_numerator = ((beat_index - signature_beat) % signature_data.numerator) + 1
+        local beat_start = beat_starts[beat_index] or 0
+        local object_time = tick_time(midi_data, current_tick) - tick_time(midi_data, beat_start)
+        return current_numerator, config.beat_denominator, beat_index, object_time, false
+    end
+
+    local beat_time = config.bpm_value / (60 / config.beat_numerator)
+    local object_time = config.current_time - obj.getvalue("time", 0, get_section())
+    if object_time == 0 then object_time = 0.1 end
+    local total_beat = math.ceil(object_time * beat_time / config.beat_numerator)
+    local current_numerator = ((total_beat - 1) % config.beat_numerator) + 1
+    local current_denominator = (math.floor((total_beat - 1) / config.beat_numerator) % config.beat_denominator) + 1
+    return current_numerator, current_denominator, total_beat, object_time, current_numerator == 1
+end
+
+local function main()
+    if midi_data then
+        config.beat_numerator, config.bpm_value = midi_values(midi_data)
+    end
+    local current_numerator, current_denominator, total_beat, object_time, denominator_switch = calc_beat()
+    local beat_time = 60 / config.bpm_value
+    local beat_index = total_beat - 1
+    local numerator_elapsed = midi_data and object_time or object_time - beat_index * beat_time
+    if not midi_data then
+        denominator_switch = beat_index % config.beat_numerator == 0
+    end
+    local previous_numerator = current_numerator == 1 and config.beat_numerator or current_numerator - 1
+    local previous_denominator = current_denominator == 1 and config.beat_denominator or current_denominator - 1
+    if midi_data then
+        previous_denominator = current_denominator
+    end
+
+    if config.format_type == 1 then
+        draw_signature(
+            { current = current_numerator, previous = previous_numerator },
+            { current = current_denominator, previous = previous_denominator },
+            numerator_elapsed, beat_time, denominator_switch
+        )
+    elseif config.format_type == 2 then
+        draw_signature(
+            { current = current_numerator, previous = previous_numerator },
+            { current = config.beat_denominator, previous = config.beat_denominator },
+            numerator_elapsed, beat_time, false
+        )
+    elseif config.format_type == 3 then
+        draw_signature(
+            { current = config.beat_numerator, previous = config.beat_numerator },
+            { current = config.beat_denominator, previous = config.beat_denominator },
+            numerator_elapsed, beat_time, false
+        )
+    elseif config.format_type == 4 then
+        draw_part(
+            current_numerator, previous_numerator, 0, config.numerator_size, numerator_elapsed,
+            beat_time, beat_time, true
+        )
+    elseif config.format_type == 5 then
+        draw_part(
+            current_denominator, previous_denominator, 0, config.denominator_size, numerator_elapsed,
+            beat_time, beat_time, denominator_switch
+        )
+    elseif config.format_type == 6 then
+        local max_size = math.max(config.numerator_size, config.denominator_size)
+        draw_text(config.bpm_value, 0, 0, max_size, 1, 1)
+    end
+end
+
+main()
+
+
+@MIDI_Visualizer
+--[[
+	MIDI ビジュアライザーです。
+	ファイル選択で MIDI ファイルを読み取り、譜面形式でノートを表示します。
+	表示範囲はトラックバーで指定した小節数分です。小節数を0にすると、拍子の分母に追従して固定拍数単位で表示します。
+    曲の前半に一定小節分空白がある場合はダイアログのタイミング調整で設定してください。
+    
+    読み込む MIDI ファイルですが、フォルダパスに日本語が含まれていると正しく読み込めない場合があります。
+    その場合はフォルダパスを英数字のみにするか、別の場所に移動してから読み込んでください。
+
+    動作には同梱の『MIDI_for_AviUtl.lua』モジュールが必要です。見つからない場合はエラーメッセージを表示します。
+	]]
+--file@file:MIDIファイル
+--track@note_height:縦幅,0,256,16,1
+--track@bar_count:小節数,0,16,4,1
+--track@note_border_thickness:鍵幅,0.1,256,2,0.1
+--track@note_width:横幅,100,1920,1280,1
+--track@display_offset:タイミング調整,-16,16,0,1
+--track@selected_track:MIDIトラック番号,0,64,0,1
+--group:イージング,false
+--separator:『EasingReceptor』が導入されていない場合は使えません
+--track@easing_id:イージング番号,0,100,1,1
+--select@easingtype_current:イージング(今),無し=0,有り(登場)=1,有り(登退場1)=2,有り(登退場2)=3,
+--select@easingtype_waiting:イージング(前),無し=0,有り(登場)=1,有り(分割登場)=2,
+--select@easingtype_played:イージング(後),無し=1,有り(退場1)=2,有り (分割退場1)=3,有り(退場2)=4,有り (分割退場2)=5,
+--group
+--color@color_current:色(今),0xffffff
+--color@color_waiting:色(前),0x404040
+--color@color_played:色(後),0xffffff
+--check@show_waiting:前表示,1
+--check@show_played:後表示,1
+
+
+local module_loaded, midi_module = pcall(require, "MIDI_for_AviUtl")
+local midi_dll = module_loaded and obj.module("MIDI_module")
+if not module_loaded or not midi_module or not midi_dll then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDI_for_AviUtl.luaまたはMIDI_module.mod2が見つかりません。\n" .. tostring(midi_module))
+    obj.draw()
+    return
+end
+
+local function main_process()
+obj.effect()
+
+if not file or file == "" then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDIファイルを指定してください。")
+    obj.draw()
+    return
+end
+
+local file_loaded, midi_data = pcall(midi_module.load, midi_dll, file)
+if not file_loaded or not midi_data then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDIファイルの読み込みに失敗しました。\n" .. tostring(midi_data))
+    obj.draw()
+    return
+end
+
+local config = {
+    -- 入力値
+    bar_count             = bar_count,
+    note_width            = note_width,
+    display_offset        = display_offset,
+    selected_track        = math.max(0, math.floor(selected_track)),
+    easing_id             = math.max(0, math.floor(easing_id)),
+    easing_mode_current   = easingtype_current,
+    easing_mode_waiting   = easingtype_waiting,
+    easing_mode_played    = easingtype_played,
+    color_current         = color_current,
+    color_waiting         = color_waiting,
+    color_played          = color_played,
+    show_waiting          = show_waiting,
+    show_played           = show_played,
+    note_height           = math.max(1, note_height),
+    note_border_thickness = math.max(0, note_border_thickness),
+
+    -- 定数
+    SEMITONES_PER_OCTAVE  = 12,
+    WHITE_KEYS_PER_OCTAVE = 7,
+    MIDI_NOTE_MIN         = 1,
+    MIDI_NOTE_MAX         = 128,
+}
+config.note_vertical_margin = config.note_height / 2
+
+local current_time = obj.time + config.display_offset
+
+local key_table = {
+    0, 0.5, 1, 1.5, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6
+}
+
+local function create_positions(config)
+    local key_positions = {}
+
+    local function note_position(note_number)
+        local octave_base = note_number - 1
+        local octave_num = math.floor(octave_base / config.SEMITONES_PER_OCTAVE)
+        local semitone_idx = (octave_base % config.SEMITONES_PER_OCTAVE) + 1
+        return octave_num * config.WHITE_KEYS_PER_OCTAVE + key_table[semitone_idx]
+    end
+
+    local max_position = note_position(config.MIDI_NOTE_MAX) + 1
+    local min_position = note_position(config.MIDI_NOTE_MIN)
+    local vertical_center = (max_position + min_position) * config.note_height / 2
+
+    for note_number = config.MIDI_NOTE_MIN, config.MIDI_NOTE_MAX do
+        local white_position = note_position(note_number)
+        key_positions[note_number] = white_position * config.note_height - vertical_center
+    end
+    
+    return key_positions
+end
+
+local key_positions = create_positions(config)
+
+local NOTE_COLORS = {
+    before = config.color_waiting,
+    active = config.color_current,
+    after = config.color_played
+}
+
+local all_notes = {}
+for _, note_info in ipairs(midi_data:GetAllNotes()) do
+    if config.selected_track <= 0 or note_info.track == config.selected_track then
+        all_notes[#all_notes + 1] = note_info
+    end
+end
+
+if not all_notes or #all_notes == 0 then
+    obj.setfont("",32,1,0xffffff,0x000000)
+    if config.selected_track > 0 then
+        obj.load("text", "指定したMIDIトラックにノートが見つかりません")
+    else
+        obj.load("text", "ノートが見つかりません")
+    end
+    obj.draw()
+    return
+end
+
+local current_tick = 0
+if midi_data.TimeToTick then
+    current_tick = midi_data:TimeToTick(current_time)
+else
+    local adjusted_time = current_time + config.display_offset
+    local tempos = midi_data.tempos or {{tick = 0, tempo = 500000}}
+    local division = midi_data.tick_quarter
+    local last_tick = 0
+    local last_tempo = tempos[1].tempo
+    local accum_time = 0
+    
+    for i, tempo_event in ipairs(tempos) do
+        local next_tick = tempo_event.tick
+        local time_at_next = accum_time + (next_tick - last_tick) * last_tempo / division / 1000000
+        
+        if time_at_next > adjusted_time then
+            local remain_time = adjusted_time - accum_time
+            current_tick = last_tick + remain_time * division * 1000000 / last_tempo
+            break
+        end
+        
+        accum_time = time_at_next
+        last_tick = next_tick
+        last_tempo = tempo_event.tempo
+    end
+    
+    if current_tick == 0 or tempos[#tempos].tick < current_tick then
+        local remain_time = adjusted_time - accum_time
+        current_tick = last_tick + remain_time * division * 1000000 / last_tempo
+    end
+end
+
+local BEAT_MODE_BEATS_PER_BLOCK = 4
+
+local boundary_starts
+local group_size
+if config.bar_count > 0 then
+    boundary_starts = midi_data:GetBarStarts()
+    group_size = config.bar_count
+else
+    boundary_starts = midi_data:GetBeatStarts()
+    group_size = BEAT_MODE_BEATS_PER_BLOCK
+end
+
+local function find_boundary(target_tick)
+    local lower_index, upper_index = 1, #boundary_starts
+    while lower_index < upper_index do
+        local middle_index = math.floor((lower_index + upper_index + 1) / 2)
+        if boundary_starts[middle_index] <= target_tick then
+            lower_index = middle_index
+        else
+            upper_index = middle_index - 1
+        end
+    end
+    return lower_index
+end
+
+local current_index = find_boundary(current_tick)
+local block_start = math.floor((current_index - 1) / group_size) * group_size + 1
+local block_end = block_start + group_size
+
+local display_start = boundary_starts[block_start]
+local display_end = boundary_starts[block_end] or (boundary_starts[#boundary_starts] + midi_data.tick_quarter * 4)
+local pixel_tick = config.note_width / (display_end - display_start)
+
+local draw_count = 0
+
+local function clip_left(position_x)
+    return math.max(position_x, -config.note_width / 2)
+end
+
+local function clip_right(position_x)
+    return math.min(position_x, config.note_width / 2)
+end
+
+local function apply_ease(ease_ratio)
+    if config.easing_id > 0 and _G.easing_eval_28 ~= nil then
+        return _G.easing_eval_28(config.easing_id, ease_ratio)
+    end
+    return ease_ratio
+end
+
+local function calc_progress(current_tick, start_tick, duration_ticks)
+    local progress_ratio = math.max(0, math.min(1, (current_tick - start_tick) / math.max(1, duration_ticks)))
+    return apply_ease(progress_ratio)
+end
+
+local function inverse_progress(current_tick, start_tick, duration_ticks)
+    local progress_ratio = math.max(0, math.min(1, (current_tick - start_tick) / math.max(1, duration_ticks)))
+    return 1 - apply_ease(1 - progress_ratio)
+end
+
+local function ratio_position(progress_ratio)
+    return -config.note_width / 2 + config.note_width * progress_ratio
+end
+
+local function wipe_position(target_tick, progress_ratio, ref_display_start, ref_display_end, ref_pixel_tick)
+    local bar_index = find_boundary(target_tick)
+    local bar_start = boundary_starts[bar_index] or ref_display_start
+    local bar_end = boundary_starts[bar_index + 1] or ref_display_end
+    local bar_left_x = (bar_start - ref_display_start) * ref_pixel_tick - config.note_width / 2
+    local bar_right_x = (bar_end - ref_display_start) * ref_pixel_tick - config.note_width / 2
+    return bar_left_x + (bar_right_x - bar_left_x) * progress_ratio
+end
+
+local function draw_rect(draw_color, left_x, right_x, top_y, bottom_y)
+    if left_x >= right_x then return end
+    draw_count = draw_count + 1
+    obj.load("figure", "四角形", draw_color, 1)
+    obj.drawpoly(
+        left_x,  -top_y,    0,
+        right_x, -top_y,    0,
+        right_x, -bottom_y, 0,
+        left_x,  -bottom_y, 0
+    )
+end
+
+local waiting_mode = config.easing_mode_waiting or 0
+local played_mode = config.easing_mode_played or 0
+
+local switch_bar_start = boundary_starts[block_start] or display_start
+local switch_bar_end = boundary_starts[block_start + 1] or display_end
+local switch_bar_ticks = math.max(1, switch_bar_end - switch_bar_start)
+local switch_bar_progress = calc_progress(current_tick, display_start, switch_bar_ticks)
+
+local switch_beat_ticks = midi_data.tick_quarter or 480
+local switch_beat_progress = calc_progress(current_tick, display_start, switch_beat_ticks)
+
+local waiting_full_limit_x = nil
+if waiting_mode == 1 and config.easing_id > 0 then
+    waiting_full_limit_x = ratio_position(calc_progress(current_tick, display_start, display_end - display_start))
+end
+
+local waiting_bar_progress = (waiting_mode == 2 and config.easing_id > 0) and switch_bar_progress or nil
+
+local played_exit_progress = nil
+local played_exit_limit_x = nil
+if (played_mode == 4 or played_mode == 5) and config.easing_id > 0 then
+    local last_bar_index = block_end - 1
+    local last_bar_start = boundary_starts[last_bar_index] or display_start
+    local last_bar_end = display_end
+    
+    if current_tick >= last_bar_start then
+        played_exit_progress = inverse_progress(current_tick, last_bar_start, last_bar_end - last_bar_start)
+        played_exit_limit_x = ratio_position(played_exit_progress)
+    end
+end
+
+obj.setoption("drawtarget", "tempbuffer", obj.screen_w, obj.screen_h)
+
+-- 前ブロックの消去
+if (played_mode == 2 or played_mode == 3) and config.easing_id > 0 and config.show_played == 1 and block_start > 1 and current_tick < display_start + switch_beat_ticks then
+    local prev_block_start = block_start - group_size
+    local prev_block_end = block_start
+    local prev_display_start = boundary_starts[prev_block_start]
+    local prev_display_end = boundary_starts[prev_block_end]
+    
+    if prev_display_start and prev_display_end then
+        local prev_pixel_tick = config.note_width / (prev_display_end - prev_display_start)
+        local prev_full_start_x = ratio_position(switch_beat_progress)
+        
+        for _, note_info in ipairs(all_notes) do
+            local note_idx = note_info.note + 1
+            local note_start = note_info.start_tick
+            local note_end = note_info.end_tick
+            
+            if key_positions[note_idx] and note_end >= prev_display_start and note_start <= prev_display_end then
+                local y_pos = key_positions[note_idx]
+                local top_y = y_pos + config.note_vertical_margin - config.note_height / 2 + config.note_border_thickness
+                local bottom_y = y_pos + config.note_height / 2 - config.note_vertical_margin - config.note_border_thickness
+                
+                local raw_left_x = (note_start - prev_display_start) * prev_pixel_tick - config.note_width / 2
+                local raw_right_x = (note_end - prev_display_start) * prev_pixel_tick - config.note_width / 2
+                
+                local erase_start_x = nil
+                if played_mode == 2 then
+                    erase_start_x = prev_full_start_x
+                elseif played_mode == 3 then
+                    erase_start_x = wipe_position(note_start, switch_beat_progress, prev_display_start, prev_display_end, prev_pixel_tick)
+                end
+                
+                local left_x = raw_left_x
+                if erase_start_x then
+                    left_x = math.max(left_x, erase_start_x)
+                end
+                
+                draw_rect(NOTE_COLORS.after, clip_left(left_x), clip_right(raw_right_x), top_y, bottom_y)
+            end
+        end
+    end
+end
+
+local function get_state(note_start, note_end)
+    if current_tick < note_start then
+        return "before"
+    elseif current_tick < note_end then
+        return "active"
+    end
+    return "after"
+end
+
+local function draw_check(note_state, note_end)
+    if note_state == "before" then
+        return config.show_waiting == 1
+    elseif note_state == "after" then
+        return config.show_played == 1
+            or (config.easing_mode_current == 2
+                and config.easing_id > 0
+                and current_tick < note_end + switch_beat_ticks)
+    end
+    return true
+end
+
+local function draw_mode(note_state, note_start, note_end, top_y, bottom_y, raw_left_x, raw_right_x, waiting_limit_x)
+    if note_state == "active" and (config.easing_mode_current == 1 or config.easing_mode_current == true) and config.easing_id > 0 then
+        local split_x = raw_left_x + (raw_right_x - raw_left_x) * calc_progress(current_tick, note_start, note_end - note_start)
+
+        draw_rect(NOTE_COLORS.active, clip_left(raw_left_x), clip_right(split_x), top_y, bottom_y)
+
+        if config.show_waiting == 1 then
+            local waiting_right = clip_right(raw_right_x)
+            if waiting_limit_x then waiting_right = math.min(waiting_right, waiting_limit_x) end
+            draw_rect(NOTE_COLORS.before, clip_left(split_x), waiting_right, top_y, bottom_y)
+        end
+    elseif note_state == "active" and config.easing_mode_current == 2 and config.easing_id > 0 then
+        local split_x = raw_left_x + (raw_right_x - raw_left_x) * calc_progress(current_tick, note_start, note_end - note_start)
+
+        draw_rect(NOTE_COLORS.active, clip_left(raw_left_x), clip_right(split_x), top_y, bottom_y)
+        if config.show_waiting == 1 then
+            local waiting_right = clip_right(raw_right_x)
+            if waiting_limit_x then waiting_right = math.min(waiting_right, waiting_limit_x) end
+            draw_rect(NOTE_COLORS.before, clip_left(split_x), waiting_right, top_y, bottom_y)
+        end
+    elseif note_state == "after" and config.easing_mode_current == 2 and config.show_played == 0 and config.easing_id > 0 and current_tick < note_end + switch_beat_ticks then
+        local split_exit_x = raw_left_x + (raw_right_x - raw_left_x) * calc_progress(current_tick, note_end, switch_beat_ticks)
+
+        draw_rect(NOTE_COLORS.after, clip_left(split_exit_x), clip_right(raw_right_x), top_y, bottom_y)
+    elseif note_state == "active" and config.easing_mode_current == 3 and config.easing_id > 0 then
+        local half_duration = math.max(1, note_end - note_start) / 2
+
+        if current_tick < note_start + half_duration then
+            local split_in_x = raw_left_x + (raw_right_x - raw_left_x) * calc_progress(current_tick, note_start, half_duration)
+
+            draw_rect(NOTE_COLORS.active, clip_left(raw_left_x), clip_right(split_in_x), top_y, bottom_y)
+            if config.show_waiting == 1 then
+                local waiting_right = clip_right(raw_right_x)
+                if waiting_limit_x then waiting_right = math.min(waiting_right, waiting_limit_x) end
+                draw_rect(NOTE_COLORS.before, clip_left(split_in_x), waiting_right, top_y, bottom_y)
+            end
+        elseif config.show_played == 0 then
+            local split_out_x = raw_left_x + (raw_right_x - raw_left_x) * inverse_progress(current_tick, note_start + half_duration, half_duration)
+
+            draw_rect(NOTE_COLORS.active, clip_left(split_out_x), clip_right(raw_right_x), top_y, bottom_y)
+        else
+            draw_rect(NOTE_COLORS.active, clip_left(raw_left_x), clip_right(raw_right_x), top_y, bottom_y)
+        end
+    elseif note_state == "before" and waiting_mode > 0 and config.easing_id > 0 then
+        local waiting_right = clip_right(raw_right_x)
+        if waiting_limit_x then waiting_right = math.min(waiting_right, waiting_limit_x) end
+
+        draw_rect(NOTE_COLORS.before, clip_left(raw_left_x), waiting_right, top_y, bottom_y)
+    elseif note_state == "after" and (played_mode == 4 or played_mode == 5) and played_exit_progress then
+        local wipe_x = nil
+        if played_mode == 4 then
+            wipe_x = played_exit_limit_x
+        elseif played_mode == 5 then
+            wipe_x = wipe_position(note_start, played_exit_progress, display_start, display_end, pixel_tick)
+        end
+
+        local left_x = raw_left_x
+        if wipe_x then
+            left_x = math.max(left_x, wipe_x)
+        end
+
+        draw_rect(NOTE_COLORS.after, clip_left(left_x), clip_right(raw_right_x), top_y, bottom_y)
+    else
+        draw_rect(NOTE_COLORS[note_state], clip_left(raw_left_x), clip_right(raw_right_x), top_y, bottom_y)
+    end
+end
+
+for _, note_info in ipairs(all_notes) do
+    local note_idx = note_info.note + 1
+    local note_start = note_info.start_tick
+    local note_end = note_info.end_tick
+    
+    local note_check_end = note_end
+    if config.easing_mode_current == 2 and config.show_played == 0 then
+        note_check_end = note_end + switch_beat_ticks
+    end
+    
+    if key_positions[note_idx] and note_check_end >= display_start and note_start <= display_end then
+        local note_state = get_state(note_start, note_end)
+
+        if draw_check(note_state, note_end) then
+            local y_pos = key_positions[note_idx]
+            local top_y = y_pos + config.note_vertical_margin - config.note_height / 2 + config.note_border_thickness
+            local bottom_y = y_pos + config.note_height / 2 - config.note_vertical_margin - config.note_border_thickness
+            
+            local raw_left_x = (note_start - display_start) * pixel_tick - config.note_width / 2
+            local raw_right_x = (note_end - display_start) * pixel_tick - config.note_width / 2
+            
+            local waiting_limit_x = nil
+            if waiting_mode == 1 then
+                waiting_limit_x = waiting_full_limit_x
+            elseif waiting_mode == 2 and waiting_bar_progress then
+                waiting_limit_x = wipe_position(note_start, waiting_bar_progress, display_start, display_end, pixel_tick)
+            end
+
+            draw_mode(note_state, note_start, note_end, top_y, bottom_y, raw_left_x, raw_right_x, waiting_limit_x)
+        end
+    end
+end
+
+obj.load("tempbuffer")
+end
+
+local success, error_msg = pcall(main_process)
+if not success then
+    obj.setfont("",32,1,0xffffff,0x000000)
+    obj.load("text", "エラー:\n" .. tostring(error_msg))
+    obj.draw()
+end
+
+
+
+@MIDI_Visualizer_02
+--[[
+	MIDI ビジュアライザーです。
+	ファイル選択で MIDI ファイルを読み取り、譜面形式でノートを表示します。
+	表示範囲はトラックバーで指定した小節数分です。
+    曲の前半に一定小節分空白がある場合はダイアログのタイミング調整で設定してください。
+    
+    読み込む MIDI ファイルですが、フォルダパスに日本語が含まれていると正しく読み込めない場合があります。
+    その場合はフォルダパスを英数字のみにするか、別の場所に移動してから読み込んでください。
+
+    動作には同梱の『MIDI_for_AviUtl.lua』モジュールが必要です。見つからない場合はエラーメッセージを表示します。
+	]]
+--file@file:MIDIファイル
+--track@note_height:縦幅,0,256,16,1
+--track@bar_count:小節数,1,16,4,1
+--track@note_border_thickness:鍵幅,0.1,256,2,0.1
+--track@note_width:横幅,100,1920,1280,1
+--track@display_offset:タイミング調整,-16,16,0,1
+--track@playhead_offset:再生位置オフセット,-960,960,0,1
+--track@playhead_marker_size:再生位置図形サイズ,1,128,16,1
+--track@playhead_rotation:図形回転,0,360,0,1
+--track@keypress_y_offset:打鍵Yオフセット,-16,16,0,0.01
+--track@selected_track:MIDIトラック番号,0,64,0,1
+--group:イージング,false
+--separator:『EasingReceptor』が導入されていない場合は使えません
+--track@easing_id:イージング番号,0,100,1,1
+--select@easingtype_offset:打鍵イージング,無し=0,有り=1
+--select@easingtype_figure:図形イージング,無し=0,有り(登場)=1,有り(登退場1)=2,
+--group
+--select@display_type:表示タイプ=1,MIDIごと=1,スクロールに合わせる=2
+--select@playhead_view:再生位置表示=1,無し=1,再生位置バー表示=2,再生位置表示=3,両方=4
+--figure@playhead_figure:再生位置図形,円
+--color@color_current:色(今),0xffffff
+--color@color_waiting:色(前),0x404040
+--color@color_played:色(後),0xffffff
+--color@playing_color:色(再生位置),0xffffff
+--color@color_figure:色(図形),0xffffff
+--check@show_current:今表示,1
+--check@show_waiting:前表示,1
+--check@show_played:後表示,1
+
+
+
+local module_loaded, MIDI = pcall(require, "MIDI_for_AviUtl")
+local midi_dll = module_loaded and obj.module("MIDI_module")
+if not module_loaded or not MIDI or not midi_dll then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDI_for_AviUtl.luaまたはMIDI_module.mod2が見つかりません。\n" .. tostring(MIDI))
+    obj.draw()
+    return
+end
+
+-- メイン処理をpcallでラップ
+local function main_process()
+obj.effect()
+
+-- MIDIファイル読み込み
+if not file or file == "" then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDIファイルを指定してください。")
+    obj.draw()
+    return
+end
+
+local file_loaded, midi_data = pcall(MIDI.load, midi_dll, file)
+if not file_loaded or not midi_data then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDIファイルの読み込みに失敗しました。\n" .. tostring(midi_data))
+    obj.draw()
+    return
+end
+
+-- 3. 各種設定値
+local config = {
+    -- 設定
+    bar_count             = bar_count,                 -- 小節数
+    note_width            = note_width,                 -- 横幅
+    display_offset        = display_offset,       -- タイミング調整
+    playhead_offset       = playhead_offset,       -- 再生位置オフセット(px)
+    playhead_marker_size  = math.max(1, playhead_marker_size), -- 再生位置図形サイズ
+    playhead_rotation     = playhead_rotation,
+    keypress_y_offset     = keypress_y_offset,       -- 打鍵Yオフセット(再生中のみ)
+    selected_track        = math.max(0, math.floor(selected_track)), -- 0:全トラック 1以上:指定トラック
+    easing_id             = math.max(0, math.floor(easing_id)),
+    easing_mode_offset    = easingtype_offset or 0,
+    easing_mode_figure    = easingtype_figure or 0,
+    color_current         = color_current, -- 色（今）
+    color_waiting         = color_waiting, -- 色（前）
+    color_played          = color_played,  -- 色（後）
+    playing_color         = playing_color, -- 再生位置バーの色
+    color_figure          = color_figure,  -- 再生位置図形の色
+    show_current          = show_current,         -- 今表示
+    show_waiting          = show_waiting,         -- 前表示
+    show_played           = show_played,          -- 後表示
+    display_type          = tonumber(display_type) or 1, -- 1:MIDIごと 2:スクロールに合わせる
+    playhead_view         = tonumber(playhead_view) or 4, -- 1:無し 2:バー 3:図形 4:両方
+    playhead_figure       = playhead_figure,      -- 再生位置図形
+    note_height           = math.max(1, note_height),     -- 全体の縦幅
+    note_border_thickness = math.max(0, note_border_thickness),    -- 鍵自体の縦幅
+    midi_tick             = midi_data.tick_quarter * 4, -- MIDIティック（4分音符1つ分 * 4）
+    
+    -- 定数
+    SEMITONES_PER_OCTAVE  = 12,                        -- C、C#、D、D#、E、F、F#、G、G#、A、A#、Bの12音
+    WHITE_KEYS_PER_OCTAVE = 7,                         -- C、D、E、F、G、A、Bの白鍵が7本
+    MIDI_NOTE_MIN         = 1,                         -- MIDIノート最小値
+    MIDI_NOTE_MAX         = 128,                       -- MIDIノート最大値
+}
+config.note_vertical_margin = config.note_height / 2
+
+-- 4. ノート描画に関する定義
+local NOTE_COLORS = {
+    before = config.color_waiting,  -- 再生前のノート色
+    active = config.color_current,  -- 再生中のノート色
+    after = config.color_played     -- 再生後のノート色
+}
+
+local PLAYHEAD_COLORS = {
+    bar = config.playing_color,    -- 再生位置バーの色
+    marker = config.color_figure   -- 再生位置図形の色
+}
+
+local KEY_TABLE = {
+    0, 0.5, 1, 1.5, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6
+}
+
+local function create_positions(param)
+    local key_positions = {}
+
+    local function note_to_position(note_num)
+        local octave_base = note_num - 1
+        local octave_num = math.floor(octave_base / param.SEMITONES_PER_OCTAVE)
+        local semitone_idx = (octave_base % param.SEMITONES_PER_OCTAVE) + 1
+        return octave_num * param.WHITE_KEYS_PER_OCTAVE + KEY_TABLE[semitone_idx]
+    end
+
+    local max_position = note_to_position(param.MIDI_NOTE_MAX) + 1
+    local min_position = note_to_position(param.MIDI_NOTE_MIN)
+    local vertical_center = (max_position + min_position) * param.note_height / 2
+
+    for note_num = param.MIDI_NOTE_MIN, param.MIDI_NOTE_MAX do
+        local white_pos = note_to_position(note_num)
+        key_positions[note_num] = white_pos * param.note_height - vertical_center
+    end
+
+    return key_positions
+end
+
+local function get_note_state(current_tick_value, note_start_tick, note_end_tick)
+    if current_tick_value < note_start_tick then
+        return "before"
+    elseif current_tick_value < note_end_tick then
+        return "active"
+    end
+    return "after"
+end
+
+local function should_draw_note(note_state, param)
+    if note_state == "active" and param.show_current == 0 then
+        return false
+    end
+    if note_state == "before" and param.show_waiting == 0 then
+        return false
+    end
+    if note_state == "after" and param.show_played == 0 then
+        return false
+    end
+    return true
+end
+
+local function get_current_tick(midi, current_time, display_offset)
+    if midi.TimeToTick then
+        return midi:TimeToTick(current_time)
+    end
+
+    local adjusted_time = current_time + display_offset
+    local tempos = midi.tempos or {{tick = 0, tempo = 500000}}
+    local division = midi.tick_quarter
+    local last_tick = 0
+    local last_tempo = tempos[1].tempo
+    local accum_time = 0
+    local current_tick = 0
+
+    for _, tempo_event in ipairs(tempos) do
+        local next_tick = tempo_event.tick
+        local time_at_next = accum_time + (next_tick - last_tick) * last_tempo / division / 1000000
+
+        if time_at_next > adjusted_time then
+            local remain_time = adjusted_time - accum_time
+            current_tick = last_tick + remain_time * division * 1000000 / last_tempo
+            break
+        end
+
+        accum_time = time_at_next
+        last_tick = next_tick
+        last_tempo = tempo_event.tempo
+    end
+
+    if current_tick == 0 then
+        local remain_time = adjusted_time - accum_time
+        current_tick = last_tick + remain_time * division * 1000000 / last_tempo
+    end
+
+    return current_tick
+end
+
+local function draw_rect(left_x, right_x, top_y, bottom_y, color)
+    if left_x >= right_x then
+        return
+    end
+    obj.load("figure", "四角形", color, 1)
+    obj.drawpoly(
+        left_x,  -top_y,    0,
+        right_x, -top_y,    0,
+        right_x, -bottom_y, 0,
+        left_x,  -bottom_y, 0
+    )
+end
+
+local function ease_value(ratio)
+    if config.easing_id > 0 and _G.easing_eval_28 then
+        return _G.easing_eval_28(config.easing_id, ratio)
+    end
+    return ratio
+end
+
+local function get_ratio(mode, note_start, note_end, current_tick, beat_ticks)
+    if mode == 0 or config.easing_id <= 0 then
+        return current_tick >= note_start and current_tick < note_end and 1 or 0
+    end
+
+    local note_duration = math.max(1, note_end - note_start)
+    if mode == 1 then
+        if current_tick < note_start or current_tick >= note_end then
+            return 0
+        end
+        local progress_ratio = math.max(0, math.min(1, (current_tick - note_start) / note_duration))
+        return ease_value(progress_ratio)
+    elseif mode == 2 then
+        if current_tick < note_start or current_tick >= note_end + beat_ticks then
+            return 0
+        elseif current_tick < note_end then
+            local progress_ratio = math.max(0, math.min(1, (current_tick - note_start) / note_duration))
+            return ease_value(progress_ratio)
+        end
+        local exit_ratio = math.max(0, math.min(1, (current_tick - note_end) / math.max(1, beat_ticks)))
+        return 1 - ease_value(exit_ratio)
+    end
+
+    return current_tick >= note_start and current_tick < note_end and 1 or 0
+end
+
+-- 5. 実描画処理
+local function main(param)
+    local all_notes = midi_data.GetAllNotes(midi_data, param.selected_track)
+    if not all_notes or #all_notes == 0 then
+        obj.setfont("",32,1,0xffffff,0x000000)
+        if param.selected_track > 0 then
+            obj.load("text", "指定したMIDIトラックにノートが見つかりません")
+        else
+            obj.load("text", "ノートが見つかりません")
+        end
+        obj.draw()
+        return
+    end
+
+    local current_time = obj.time + param.display_offset
+    local current_tick = get_current_tick(midi_data, current_time, param.display_offset)
+    local key_positions = create_positions(param)
+
+    local tick_bar = param.midi_tick * param.bar_count
+    local pixel_tick = param.note_width / tick_bar
+    local clamped_playhead_offset = math.max(-param.note_width / 2, math.min(param.note_width / 2, param.playhead_offset))
+    local display_start = current_tick - (clamped_playhead_offset + param.note_width / 2) / pixel_tick
+    local display_end = display_start + tick_bar
+    local playhead_x = clamped_playhead_offset
+    local show_playhead_bar = (param.playhead_view == 2 or param.playhead_view == 4)
+    local show_playhead_marker = (param.playhead_view == 3 or param.playhead_view == 4)
+
+    obj.setoption("drawtarget", "tempbuffer", obj.screen_w, obj.screen_h)
+
+    for _, note_data in ipairs(all_notes) do
+        local note_index = note_data.note + 1
+        local note_start_tick = note_data.start_tick
+        local note_end_tick = note_data.end_tick
+        local note_y_pos = key_positions[note_index]
+
+        if note_y_pos and note_end_tick >= display_start and note_start_tick <= display_end then
+            local note_state = get_note_state(current_tick, note_start_tick, note_end_tick)
+            local offset_ratio = get_ratio(
+                param.easing_mode_offset, note_start_tick, note_end_tick,
+                current_tick, midi_data.tick_quarter or 480
+            )
+            local render_y_pos = note_y_pos + param.keypress_y_offset * offset_ratio
+
+            if should_draw_note(note_state, param) then
+                local top_y = render_y_pos + param.note_vertical_margin - param.note_height / 2 + param.note_border_thickness
+                local bottom_y = render_y_pos + param.note_height / 2 - param.note_vertical_margin - param.note_border_thickness
+
+                local left_x = (note_start_tick - display_start) * pixel_tick - param.note_width / 2
+                local right_x = (note_end_tick - display_start) * pixel_tick - param.note_width / 2
+                left_x = math.max(left_x, -param.note_width / 2)
+                right_x = math.min(right_x, param.note_width / 2)
+
+                if left_x < right_x then
+                    if note_state == "active" and param.display_type == 2 then
+                        local highlight_half = math.max(1, pixel_tick * 0.5)
+                        local active_left = math.max(left_x, playhead_x - highlight_half)
+                        local active_right = math.min(right_x, playhead_x + highlight_half)
+
+                        if param.show_played ~= 0 then
+                            draw_rect(left_x, active_left, top_y, bottom_y, NOTE_COLORS.after)
+                        end
+
+                        draw_rect(active_left, active_right, top_y, bottom_y, NOTE_COLORS.active)
+
+                        if param.show_waiting ~= 0 then
+                            draw_rect(active_right, right_x, top_y, bottom_y, NOTE_COLORS.before)
+                        end
+                    elseif note_state == "active" then
+                        draw_rect(left_x, right_x, top_y, bottom_y, NOTE_COLORS.active)
+                    else
+                        draw_rect(left_x, right_x, top_y, bottom_y, NOTE_COLORS[note_state])
+                    end
+                end
+            end
+
+            local figure_ratio = get_ratio(
+                param.easing_mode_figure, note_start_tick, note_end_tick,
+                current_tick, midi_data.tick_quarter or 480
+            )
+            local marker_visible = show_playhead_marker and figure_ratio > 0
+            if marker_visible then
+                obj.load("figure", param.playhead_figure, PLAYHEAD_COLORS.marker, param.playhead_marker_size * figure_ratio)
+                obj.draw(playhead_x, -render_y_pos, 0, 1, 1, 0, 0, param.playhead_rotation)
+            end
+        end
+    end
+
+    if show_playhead_bar then
+        draw_rect(playhead_x - 0.5, playhead_x + 0.5, -obj.screen_h / 2, obj.screen_h / 2, PLAYHEAD_COLORS.bar)
+    end
+
+    obj.load("tempbuffer")
+end
+
+main(config)
+end
+
+local success, error_msg = pcall(main_process)
+if not success then
+    obj.setfont("",32,1,0xffffff,0x000000)
+    obj.load("text", "エラー:\n" .. tostring(error_msg))
+    obj.draw()
+end
+
+
+
+@MIDI_ChordTone
+--[[
+    コード構成音表示です。
+    読み込んだ MIDI ファイルからコードの構成音を表示します。
+    例えば Cmaj なら『C4 E4 G4』と表示されます。
+    音名のみにチェックを入れると、オクターブ表記がなくなり『C E G』と表示されます。
+    区切り文字に改行コードをぶち込めば改行可能です。
+    逆順表示と組み合わせることで、下から上に向かって音が積み重なるような表示も可能です。
+
+    読み込む MIDI ファイルですが、フォルダパスに日本語が含まれていると正しく読み込めない場合があります。
+    その場合はフォルダパスを英数字のみにするか、別の場所に移動してから読み込んでください。
+
+    動作には同梱の『MIDI_for_AviUtl.lua』モジュールが必要です。見つからない場合はエラーメッセージを表示します。
+    ]]
+--file@file:MIDIファイル
+--track@text_size:サイズ,1,4098,64,1
+--track@selected_track:MIDIトラック番号,0,64,0,1
+--group:イージング,false
+--separator:『EasingReceptor』が導入されていない場合は使えません
+--track@easing_id:軌道番号,0,100,1,1
+--select@easing_size:イージング(大きさ),無し=0,有り(登場)=1,
+--select@easing_y:イージング(Y軸),無し=0,有り(登場)=1,
+--group
+--check@key_only:音名のみ,0
+--check@degree_name:ディグリーネーム表記,0
+--check@use_flat:♭表記使用,0
+--select@tone_name:キー(調)=0,C=0,C# / D♭=1,D=2,D# / E♭=3,E=4,F=5,F# / G♭=6,G=7,G# / A♭=8,A=9,A# / B♭=10,B=11
+--check@reverse_order:逆順表示,0
+--font@text_font:フォント,游ゴシック Light
+--color@text_color:色,0x02edaf
+--dialog:区切り,local note_delimiter=" , ";
+
+local module_loaded, MIDI = pcall(require, "MIDI_for_AviUtl")
+local midi_dll = module_loaded and obj.module("MIDI_module")
+if not module_loaded or not MIDI or not midi_dll then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDI_for_AviUtl.luaまたはMIDI_module.mod2が見つかりません。\n" .. tostring(MIDI))
+    obj.draw()
+    return
+end
+
+local config = {
+    note_delimiter = note_delimiter,                 -- 音名区切り文字
+    text_font = text_font or "游ゴシック Light",  -- テキストフォント
+    text_color = text_color or 0x02edaf,             -- テキスト色
+    midi_path = midi_path,                           -- MIDIファイルパス
+    text_size = text_size,                            -- テキストサイズ
+    selected_track = math.max(0, math.floor(selected_track)), -- 0:全トラック 1以上:指定トラック
+    key_only = key_only,                             -- キー名のみ表示フラグ
+    degree_name = degree_name,
+    use_flat = use_flat,
+    tone_name = tone_name or 0,
+    reverse_order = reverse_order,                   -- 逆順表示フラグ
+    easing_id = easing_id,
+    easing_size = easing_size,
+    easing_y = easing_y,
+    y_offset = 25,
+}
+
+if not midi_path or midi_path == "" then
+    obj.setfont(config.text_font, config.text_size, 0, config.text_color)
+    obj.load("text", "MIDIファイルを指定してください。")
+    return
+end
+
+local file_loaded, midi_data = pcall(MIDI.load, midi_dll, midi_path)
+if not file_loaded or not midi_data then
+    obj.setfont(config.text_font, config.text_size, 0, config.text_color)
+    obj.load("text", "MIDIファイルの読み込みに失敗しました。\n" .. tostring(midi_data))
+    return
+end
+
+local chord_config_loaded, chord_config = pcall(require, "chord_config")
+if not chord_config_loaded or not chord_config then
+    obj.setfont(config.text_font, config.text_size, 0, config.text_color)
+    obj.load("text", "chord_config.luaが見つかりません。\n" .. tostring(chord_config))
+    obj.draw()
+    return
+end
+
+local function extract_key(note_name)
+    local result = note_name:match("([A-G]#?)")
+    return result or note_name
+end
+
+local function reverse_table(note_list)
+    local n = #note_list
+    for i = 1, math.floor(n/2) do
+        note_list[i], note_list[n-i+1] = note_list[n-i+1], note_list[i]
+    end
+end
+
+local active_notes = {}
+for _, note_info in ipairs(midi_data:GetAllNotes()) do
+    if note_info.startTime <= obj.time and note_info.endTime > obj.time then
+        if config.selected_track <= 0 or note_info.track == config.selected_track then
+            active_notes[#active_notes + 1] = {
+                track = note_info.track,
+                note = note_info.note,
+                note_name = midi_data:note_name(note_info.note),
+                startTime = note_info.startTime,
+                endTime = note_info.endTime
+            }
+        end
+    end
+end
+
+table.sort(active_notes, function(a, b) return a.note < b.note end)
+
+if config.reverse_order == 1 then
+    reverse_table(active_notes)
+end
+
+local key_list = {}
+local seen = {}
+for _, note_info in ipairs(active_notes) do
+    local key_name = note_info.note_name
+    local note_key = note_info.note
+    if not seen[note_key] then
+        seen[note_key] = true
+        local note_name = extract_key(key_name)
+        if config.degree_name == 1 then
+            local note_number = chord_config.note_table[note_name]
+            local degree_table = config.use_flat == 1 and chord_config.flat_table or chord_config.sharp_table
+            key_name = note_number and degree_table[((note_number - config.tone_name) % 12) + 1] or key_name
+        elseif config.use_flat == 1 then
+            key_name = chord_config.map_table[note_name] or note_name
+            if config.key_only ~= 1 then
+                key_name = key_name .. (note_info.note_name:match("%d+$") or "")
+            end
+        elseif config.key_only == 1 then
+            key_name = extract_key(key_name)
+        end
+        table.insert(key_list, key_name)
+    end
+end
+
+local text = #key_list > 0 and table.concat(key_list, config.note_delimiter) or ""
+local start_time = math.huge
+local end_time = 0
+for _, note_info in ipairs(active_notes) do
+    start_time = math.min(start_time, note_info.startTime)
+    end_time = math.max(end_time, note_info.endTime)
+end
+
+local function ease_value(ratio)
+    if config.easing_id > 0 and _G.easing_eval_28 then
+        return _G.easing_eval_28(config.easing_id, ratio)
+    end
+    return ratio
+end
+
+local function get_ratio(mode, elapsed_time, duration_time, beat_time)
+    if mode == 0 or config.easing_id <= 0 then return 1 end
+    if mode == 1 then
+        return ease_value(math.max(0, math.min(1, elapsed_time / duration_time)))
+    end
+    return 1
+end
+
+local current_tick = midi_data:TimeToTick(obj.time)
+local tempo_event = midi_data.tempos[1]
+for _, event_data in ipairs(midi_data.tempos) do
+    if event_data.tick > current_tick then break end
+    tempo_event = event_data
+end
+local beat_time = tempo_event.microsec / 1000000
+local elapsed_time = obj.time - start_time
+local duration_time = math.max(0.001, end_time - start_time)
+local size_ratio = get_ratio(config.easing_size, elapsed_time, duration_time, beat_time)
+local y_ratio = get_ratio(config.easing_y, elapsed_time, duration_time, beat_time)
+local position_y = -config.y_offset * (1 - y_ratio)
+if #active_notes > 0 and size_ratio > 0 and y_ratio > 0 then
+    obj.setfont(config.text_font, config.text_size, 0, config.text_color)
+    obj.load("text", text)
+    obj.draw(0, position_y, 0, size_ratio, y_ratio)
+end
+
+
+@MIDI_ChordDetection
+--[[
+    コード検出です。
+    読み込んだ MIDI ファイルから再生中のコードを表示します。
+    例えば 『E G B』 なら『Em』と表示されます。
+    判定可能なコードは同梱の『chord_config.lua』で設定されています。
+    基本的なコードしか対応していない為、高度なコードを追加したい場合は同梱の『chord_config.lua』を編集してください。
+    チェックボックスでディグリネーム表記や♭表記の使用が可能です。
+    例えば、ダイアログで指定しているキーがCの場合、ディグリーネーム表記を有効にすると『C』『E』『G』は『I』『III』『V』と表示されます。
+    ダイアログで指定しているキーを変更することで、他のキーにも対応可能です。
+    例えばキーをDに設定した場合、『D』『F#』『A』は『I』『III』『V』と表示されます。
+
+    読み込む MIDI ファイルですが、フォルダパスに日本語が含まれていると正しく読み込めない場合があります。
+    その場合はフォルダパスを英数字のみにするか、別の場所に移動してから読み込んでください。
+
+    動作には同梱の『MIDI_for_AviUtl.lua』モジュールと『chord_config.lua』が必要です。見つからない場合はエラーメッセージを表示します。
+    ]]
+--file@file:MIDIファイル
+--track@text_size:サイズ,1,4098,64,1
+--track@selected_track:MIDIトラック番号,0,64,0,1
+--group:イージング,false
+--separator:『EasingReceptor』が導入されていない場合は使えません
+--track@easing_id:軌道番号,0,100,1,1
+--select@easing_size:イージング(大きさ),無し=0,有り(登場)=1,
+--select@easing_y:イージング(Y軸),無し=0,有り(登場)=1,
+--group
+--color@text_color:色,0x02edaf
+--font@text_font:フォント,游ゴシック Light
+--check@degree_name:ディグリーネーム表記,0
+--check@use_flat:♭表記使用,0
+--select@tone_name:キー(調)=0,C=0,C# / D♭=1,D=2,D# / E♭=3,E=4,F=5,F# / G♭=6,G=7,G# / A♭=8,A=9,A# / B♭=10,B=11
+--dialog:判定不能表示,local not_found="";
+
+local module_loaded, MIDI = pcall(require, "MIDI_for_AviUtl")
+local midi_dll = module_loaded and obj.module("MIDI_module")
+if not module_loaded or not MIDI or not midi_dll then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDI_for_AviUtl.luaまたはMIDI_module.mod2が見つかりません。\n" .. tostring(MIDI))
+    obj.draw()
+    return
+end
+
+local config = {
+    text_size = text_size,                            -- テキストサイズ
+    selected_track = math.max(0, math.floor(selected_track)), -- 0:全トラック 1以上:指定トラック
+    not_found = not_found,                      -- 判定不能時テキスト
+    tone_name = tone_name or 0,                       -- キー(調)番号(0=C, 1=C#/D♭, ... 11=B)
+    degree_flag = degree_name,                  -- ディグリーネーム表記フラグ
+    text_font = text_font or "游ゴシック Light",  -- テキストフォント
+    text_color = text_color or 0x02edaf,             -- テキスト色
+    flat_flag = use_flat,                        -- ♭表記使用フラグ
+    easing_id = easing_id,
+    easing_size = easing_size,
+    easing_y = easing_y,
+    y_offset = 25,
+}
+
+local chord_config_loaded, chord_config = pcall(require, "chord_config")
+if not chord_config_loaded or not chord_config then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "chord_config.luaが見つかりません。\n" .. tostring(chord_config))
+    obj.draw()
+    return
+end
+
+if not file or file == "" then
+    obj.setfont(config.text_font, config.text_size, 0, config.text_color)
+    obj.load("text", "MIDIファイルを指定してください。")
+    return
+end
+
+local file_loaded, midi_data = pcall(MIDI.load, file)
+if not file_loaded or not midi_data then
+    obj.setfont(config.text_font, config.text_size, 0, config.text_color)
+    obj.load("text", "MIDIファイルの読み込みに失敗しました。\n" .. tostring(midi_data))
+    return
+end
+
+local function unique_notes(note_list)
+    local seen, result = {}, {}
+    for _, n in ipairs(note_list) do if not seen[n] then seen[n]=true; result[#result+1]=n end end
+    return result
+end
+
+local function convert_chord(chord_str, chord_data, flat_flag)
+    return (flat_flag == 1 and chord_str and chord_str:gsub("^([A-G][#♭]?)", function(note)
+        return chord_data.map_table[note] or note
+    end):gsub("/([A-G][#♭]?)", function(note)
+        return "/" .. (chord_data.map_table[note] or note)
+    end)) or chord_str
+end
+
+local function convert_degree(chord_str, key_off, flat_flag, chord_data)
+    local root_note, chord_suffix = chord_str:match("^([A-G][#♭]?)(.*)")
+    if not root_note then return chord_str end
+    local root_num = chord_data.note_table[root_note]
+    if not root_num then return chord_str end
+    local root_number = (root_num - key_off + 12) % 12
+    local degree_list = flat_flag == 1 and chord_data.flat_table or chord_data.sharp_table
+    local root_degree = degree_list[root_number + 1]
+    local slash_note = chord_suffix:match("/([A-G][#♭]?)")
+    if slash_note then
+        local bass_num = chord_data.note_table[slash_note]
+        if bass_num then
+            local bass_number = (bass_num - key_off + 12) % 12
+            local bass_degree = degree_list[bass_number + 1]
+            chord_suffix = chord_suffix:gsub("/"..slash_note, "/"..bass_degree)
+        end
+    end
+    return root_degree .. chord_suffix
+end
+
+local function show_chord(chord_text, config, chord_data)
+    local display_str
+    if config.degree_flag == 1 then
+        display_str = convert_chord(chord_text, chord_data, 0)
+        local key_num = config.tone_name
+        display_str = convert_degree(display_str, key_num, config.flat_flag, chord_data)
+    else
+        display_str = convert_chord(chord_text, chord_data, config.flat_flag)
+    end
+    return display_str
+end
+
+local function get_keys(active_notes)
+    local key_list = {}
+    for _, note_info in ipairs(active_notes) do
+        local key_name = note_info.note_name:match("([A-G][#♭]?)")
+        if key_name then
+            key_list[#key_list+1] = key_name
+        end
+    end
+    return unique_notes(key_list)
+end
+
+local function match_intervals(chord_intervals, template_str)
+    local required_intervals = {}
+    for interval in template_str:gmatch("%d+") do
+        required_intervals[tonumber(interval)] = true
+    end
+    for _, interval in ipairs(chord_intervals) do
+        required_intervals[interval] = nil
+    end
+    return not next(required_intervals)
+end
+
+local function detect_chord(key_list, config, chord_data)
+    if #key_list == 0 then
+        return config.not_found
+    end
+    for _, root_note in ipairs(key_list) do
+        local base_note = chord_data.note_table[root_note]
+        local chord_intervals = {}
+        for _, note_name in ipairs(key_list) do
+            table.insert(chord_intervals, (chord_data.note_table[note_name] - base_note) % 12)
+        end
+        table.sort(chord_intervals)
+        local bass_note = key_list[1]
+        local chord_list = {}
+        for interval_pattern, chord_suffix in pairs(chord_data.chord_table) do
+            if match_intervals(chord_intervals, interval_pattern) then
+                table.insert(chord_list, {
+                    name = root_note .. chord_suffix,
+                    root = root_note,
+                    bass = bass_note,
+                    priority = chord_data.priority_table[chord_suffix] or 100
+                })
+            end
+        end
+        if #chord_list > 0 then
+            table.sort(chord_list, function(a, b) return a.priority < b.priority end)
+            local selected_chord = chord_list[1]
+            if selected_chord.bass ~= selected_chord.root then
+                return selected_chord.name .. "/" .. selected_chord.bass
+            else
+                return selected_chord.name
+            end
+        end
+    end
+    return config.not_found
+end
+
+local chord_data = {
+    note_table = chord_config.note_table,
+    map_table = chord_config.map_table,
+    sharp_table = chord_config.sharp_table,
+    flat_table = chord_config.flat_table,
+    chord_table = chord_config.chord_table or {},
+    priority_table = chord_config.priority_table or {}
+}
+
+local active_notes = {}
+for _, note_info in ipairs(midi_data:GetAllNotes()) do
+    if note_info.startTime <= obj.time and note_info.endTime > obj.time then
+        if config.selected_track <= 0 or note_info.track == config.selected_track then
+            active_notes[#active_notes + 1] = {
+                track = note_info.track,
+                note = note_info.note,
+                note_name = midi_data:note_name(note_info.note),
+                startTime = note_info.startTime,
+                endTime = note_info.endTime
+            }
+        end
+    end
+end
+local key_list = get_keys(active_notes)
+local chord_name = detect_chord(key_list, config, chord_data)
+local display_text = show_chord(chord_name, config, chord_data)
+local start_time = math.huge
+local end_time = 0
+for _, note_info in ipairs(active_notes) do
+    start_time = math.min(start_time, note_info.startTime)
+    end_time = math.max(end_time, note_info.endTime)
+end
+
+local function ease_value(ratio)
+    if config.easing_id > 0 and _G.easing_eval_28 then
+        return _G.easing_eval_28(config.easing_id, ratio)
+    end
+    return ratio
+end
+
+local function get_ratio(mode, elapsed_time, duration_time, beat_time)
+    if mode == 0 or config.easing_id <= 0 then return 1 end
+    if mode == 1 then
+        return ease_value(math.max(0, math.min(1, elapsed_time / duration_time)))
+    end
+    return 1
+end
+
+local current_tick = midi_data:TimeToTick(obj.time)
+local tempo_event = midi_data.tempos[1]
+for _, event_data in ipairs(midi_data.tempos) do
+    if event_data.tick > current_tick then break end
+    tempo_event = event_data
+end
+local beat_time = tempo_event.microsec / 1000000
+local elapsed_time = obj.time - start_time
+local duration_time = math.max(0.001, end_time - start_time)
+local size_ratio = get_ratio(config.easing_size, elapsed_time, duration_time, beat_time)
+local y_ratio = get_ratio(config.easing_y, elapsed_time, duration_time, beat_time)
+local position_y = -config.y_offset * (1 - y_ratio)
+if #active_notes > 0 and size_ratio > 0 and y_ratio > 0 then
+    obj.setfont(config.text_font, config.text_size, 0, config.text_color)
+    obj.load("text", display_text)
+    obj.draw(0, position_y, 0, size_ratio, y_ratio)
+end

@@ -1,0 +1,335 @@
+@BitterDance
+--[[
+    ビターダンスです。
+    一枚の画像を分割して、指定された行の画像をBPMに合わせて順次表示します。
+    FL Studio の Fruity Dance っぽいものを作りたくて作りました。
+    対象行数を超えた場合はランダムで行を選択します。
+]]
+--track@split_row:分割行数,1,64,10,1
+--track@split_col:分割列数,1,64,8,1
+--track@target_row:対象行数,1,65,1,1
+--track@display_speed:変化速度,-16,16,4,1
+--value@set_BPM:BPM,128
+
+local config = {
+    split_row = split_row,
+    split_col = split_col,
+    target_row = target_row,
+    display_speed = display_speed,
+    BPM = set_BPM,
+    beat_time = set_BPM / 60,
+    object_time = obj.time * display_speed
+}
+
+
+if config.display_speed == 0 then
+    config.display_speed = 1
+end 
+
+
+
+local now_beat = math.ceil(config.object_time * config.beat_time + 1 )   -- 表示速度を考慮して現在の拍数を計算
+local count = ((now_beat - 1) % config.split_col) + 1
+
+
+local part_w = obj.w / config.split_col
+local part_h = obj.h / config.split_row
+
+-- countの値が変化したタイミングでのみtarget_rowを乱数で更新し、値を保持する
+if config.target_row > config.split_row then
+    if count ~= prev_count then
+        prev_target_row = obj.rand(1, config.split_row)
+        prev_count = count
+    end
+    config.target_row = prev_target_row
+end
+local sx =  (count) * part_w - part_w
+local sy = (config.target_row - 1) * part_h
+obj.drawpoly(
+-part_w/2, -part_h/2, 0,
+part_w/2, -part_h/2, 0,
+part_w/2, part_h/2, 0,
+-part_w/2, part_h/2, 0,
+sx, sy,
+sx + part_w, sy,
+sx + part_w, sy + part_h,
+sx, sy + part_h
+)
+
+
+@MIDI_NoteSync
+--[[
+	MIDIを読み込んでその位置にオブジェクトを表示します。
+    読み込む MIDI ファイルですが、フォルダパスに日本語が含まれていると正しく読み込めない場合があります。
+    その場合はフォルダパスを英数字のみにするか、別の場所に移動してから読み込んでください。
+    動作には同梱の『MIDI_for_AviUtl.lua』モジュールが必要です。見つからない場合はエラーメッセージを表示します。
+	]]
+--track@note_height:縦幅,0,256,16,1
+--track@display_offset:タイミング調整,-16,16,0,1
+--track@playhead_offset:再生位置オフセット,-960,960,0,1
+--track@zoom_percent:拡大率,1,400,100,1
+--track@selected_track:MIDIトラック番号,0,64,0,1
+--check@octave_mode:オクターブ違いを同音として扱う　　,1
+--check@simple_mode:シンプル表示,0
+--group:イージング,false
+--track@easing_id:イージング番号,0,100,0,1
+--select@easingtype_current:イージング(サイズ),無し=0,有り(登場)=1,有り(登退場1)=2,,有り(登退場2)=3,
+--group
+--file@file:MIDIファイル
+
+
+local module_loaded, MIDI = pcall(require, "MIDI_for_AviUtl")
+local midi_module = module_loaded and obj.module("MIDI_module")
+if not module_loaded or not MIDI or not midi_module then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDI_for_AviUtl.luaまたはMIDI_module.mod2が見つかりません。\n" .. tostring(MIDI))
+    obj.draw()
+    return
+end
+
+local function main_process()
+
+if not file or file == "" then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDIファイルを指定してください。")
+    obj.draw()
+    return
+end
+
+local file_loaded, midi_data = pcall(MIDI.load, midi_module, file)
+if not file_loaded or not midi_data then
+    obj.setfont("",64,1,0xffffff,0x000000)
+    obj.load("text", "MIDIファイルの読み込みに失敗しました。\n" .. tostring(midi_data))
+    obj.draw()
+    return
+end
+
+
+local config = {
+    note_height     = math.max(1, note_height),
+    display_offset  = display_offset,
+    playhead_offset = playhead_offset,
+    zoom_percent    = math.max(1, zoom_percent),
+    selected_track  = math.max(0, math.floor(selected_track)),
+    octave_mode     = octave_mode,
+    simple_mode     = simple_mode,
+
+    easing_id            = math.max(0, math.floor(easing_id)),
+    easing_mode_current  = easingtype_current or 0,
+
+    -- 定数
+    SEMITONES_PER_OCTAVE  = 12,
+    WHITE_KEYS_PER_OCTAVE = 7,
+    MIDI_NOTE_MIN         = 1,
+    MIDI_NOTE_MAX         = 128,
+}
+
+local KEY_TABLE = {
+    0, 0.5, 1, 1.5, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6
+}
+
+local function create_positions(param)
+    local key_positions = {}
+
+    local function note_to_position(note_num)
+        local octave_base = note_num - 1
+        local octave_num = math.floor(octave_base / param.SEMITONES_PER_OCTAVE)
+        local semitone_idx = (octave_base % param.SEMITONES_PER_OCTAVE) + 1
+        if param.octave_mode == 0 then
+            return octave_num * param.WHITE_KEYS_PER_OCTAVE + KEY_TABLE[semitone_idx]
+        else
+            return KEY_TABLE[semitone_idx]
+        end
+    end
+
+    local max_position, min_position
+    if param.octave_mode == 0 then
+        max_position = note_to_position(param.MIDI_NOTE_MAX) + 1
+        min_position = note_to_position(param.MIDI_NOTE_MIN)
+    else
+        max_position = KEY_TABLE[param.SEMITONES_PER_OCTAVE] + 1
+        min_position = 0
+    end
+    local vertical_center = (max_position + min_position) * param.note_height / 2
+
+    for note_num = param.MIDI_NOTE_MIN, param.MIDI_NOTE_MAX do
+        local white_pos = note_to_position(note_num)
+        key_positions[note_num] = white_pos * param.note_height - vertical_center
+    end
+
+    return key_positions
+end
+
+local function get_current_tick(midi, current_time, display_offset)
+    if midi.TimeToTick then
+        return midi:TimeToTick(current_time)
+    end
+
+    local adjusted_time = current_time + display_offset
+    local tempos = midi.tempos or {{tick = 0, tempo = 500000}}
+    local division = midi.tick_quarter
+    local last_tick = 0
+    local last_tempo = tempos[1].tempo
+    local accum_time = 0
+    local current_tick = 0
+
+    for _, tempo_event in ipairs(tempos) do
+        local next_tick = tempo_event.tick
+        local time_at_next = accum_time + (next_tick - last_tick) * last_tempo / division / 1000000
+
+        if time_at_next > adjusted_time then
+            local remain_time = adjusted_time - accum_time
+            current_tick = last_tick + remain_time * division * 1000000 / last_tempo
+            break
+        end
+
+        accum_time = time_at_next
+        last_tick = next_tick
+        last_tempo = tempo_event.tempo
+    end
+
+    if current_tick == 0 then
+        local remain_time = adjusted_time - accum_time
+        current_tick = last_tick + remain_time * division * 1000000 / last_tempo
+    end
+
+    return current_tick
+end
+
+local function get_zoom_ratio(mode, note_start, note_end, current_tick, easing_id, trans_beat_ticks)
+    if mode == 0 or easing_id <= 0 then
+        if current_tick >= note_start and current_tick < note_end then
+            return 1, true
+        end
+        return 0, false
+    end
+
+    local eval = _G.easing_eval_28
+    local dur = math.max(1, note_end - note_start)
+
+    if mode == 1 then
+        if current_tick < note_start or current_tick >= note_end then
+            return 0, false
+        end
+        local ratio = (current_tick - note_start) / dur
+        ratio = math.max(0, math.min(1, ratio))
+        local eased = eval and eval(easing_id, ratio) or ratio
+        return eased, true
+
+    elseif mode == 2 then
+        local extended_end = note_end + trans_beat_ticks
+        if current_tick < note_start or current_tick >= extended_end then
+            return 0, false
+        end
+
+        if current_tick < note_end then
+            local ratio = (current_tick - note_start) / dur
+            ratio = math.max(0, math.min(1, ratio))
+            local eased = eval and eval(easing_id, ratio) or ratio
+            return eased, true
+        else
+            local exit_ratio = (current_tick - note_end) / math.max(1, trans_beat_ticks)
+            exit_ratio = math.max(0, math.min(1, exit_ratio))
+            local eased_exit = eval and eval(easing_id, exit_ratio) or exit_ratio
+            return 1 - eased_exit, true
+        end
+
+    elseif mode == 3 then
+        if current_tick < note_start or current_tick >= note_end then
+            return 0, false
+        end
+
+        local half_dur = dur / 2
+        if current_tick < note_start + half_dur then
+            local ratio = (current_tick - note_start) / half_dur
+            ratio = math.max(0, math.min(1, ratio))
+            local eased = eval and eval(easing_id, ratio) or ratio
+            return eased, true
+        else
+            local ratio = (current_tick - (note_start + half_dur)) / half_dur
+            ratio = math.max(0, math.min(1, ratio))
+            local inv_eased = ratio
+            if eval then
+                inv_eased = 1 - eval(easing_id, 1 - ratio)
+            end
+            return 1 - inv_eased, true
+        end
+    end
+
+    if current_tick >= note_start and current_tick < note_end then
+        return 1, true
+    end
+    return 0, false
+end
+
+local function main(param)
+    obj.effect()
+
+    local all_notes = midi_data.GetAllNotes(midi_data, param.selected_track)
+    if not all_notes or #all_notes == 0 then
+        obj.draw(0, 0, 0, 1, 0)
+        return
+    end
+
+    local current_time = obj.time + param.display_offset
+    local current_tick = get_current_tick(midi_data, current_time, param.display_offset)
+    local zoom = param.zoom_percent / 100
+    local trans_beat_ticks = midi_data.tick_quarter or 480
+
+    if param.simple_mode == 1 then
+        local any_visible = false
+        local best_ratio = 0
+        for _, note_data in ipairs(all_notes) do
+            local ratio, visible = get_zoom_ratio(
+                param.easing_mode_current, note_data.start_tick, note_data.end_tick,
+                current_tick, param.easing_id, trans_beat_ticks
+            )
+            if visible and ratio > best_ratio then
+                best_ratio = ratio
+                any_visible = true
+            end
+        end
+
+        if any_visible and best_ratio > 0 then
+            obj.draw(param.playhead_offset, 0, 0, zoom * best_ratio, 1)
+        else
+            obj.draw(0, 0, 0, 1, 0)
+        end
+        return
+    end
+
+
+    local key_positions = create_positions(param)
+    local visible_notes = {}
+    for _, note_data in ipairs(all_notes) do
+        local ratio, visible = get_zoom_ratio(
+            param.easing_mode_current, note_data.start_tick, note_data.end_tick,
+            current_tick, param.easing_id, trans_beat_ticks
+        )
+        if visible and ratio > 0 then
+            local y_pos = key_positions[note_data.note + 1]
+            if y_pos then
+                visible_notes[#visible_notes + 1] = { y = y_pos, ratio = ratio }
+            end
+        end
+    end
+
+    if #visible_notes == 0 then
+        obj.draw(0, 0, 0, 1, 0)
+        return
+    end
+
+    for _, note in ipairs(visible_notes) do
+        obj.draw(param.playhead_offset, -note.y, 0, zoom * note.ratio, 1)
+    end
+end
+
+main(config)
+end
+
+local success, error_msg = pcall(main_process)
+if not success then
+    obj.setfont("",32,1,0xffffff,0x000000)
+    obj.load("text", "エラー:\n" .. tostring(error_msg))
+    obj.draw()
+end

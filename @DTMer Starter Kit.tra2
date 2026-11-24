@@ -1,0 +1,263 @@
+--[[
+    この Script のバージョンは【β版】です。
+    最新版についてはDL先を参照してください。
+
+    これは AviUtl2 用の音声系スクリプトまとめです。
+    各スクリプトの説明は配布ページの Wiki を参照してください。
+    同サイトでDL可能な『DTMer Starter Kit.tra』は AviUtl 用の Script であり、 rikky_module に依存している為 AviUtl2 環境で動作しません。
+    そこで、 rikky_module に依存しない形で同等の機能を実装したのが本 script です。
+    その為、 rikky_module を使用した元の script と動作や機能が少し異なる部分があります。
+
+    免責事項
+    ・本 Script のリファクタ作業を Github Copilot にお手伝いして頂いております。
+    基本的には提案を元に試行錯誤しておりますが、一部 Github Copilot の提案をそのまま使用している箇所もありますので、問題の箇所がありましたらご連絡ください。直ちに修正致します。
+    ・本 Script を使用したことにより発生したいかなる損害についても、作者は一切の責任を負いません。。
+]]
+
+@SoundSync_Live
+--[[
+    音声同期です。
+    『SoundSync_Live@DTMer Starter Kit』の値を利用して、トラックバーの値を音声同期させます。
+    param値で音声同期の強度を調整可能です。
+    トラックバーの終点値はどっち方向に増減するかを決めてる程度で、全然あてにならないのでparam値で調整してください。
+    最終フレームでトラックバーの終点値になっちゃうのはAviUtlの仕様です。どうにかする方法を知っていたら教えてください。
+]]
+--param:変化倍率,100
+
+-- 音声同期(追従式)
+local function audio_sync()
+    local raw_index = obj.getpoint("index") or 0
+    local index = math.floor(raw_index)
+    local start_value = obj.getpoint(index)
+    local end_value = obj.getpoint(index + 1)
+    if type(start_value) ~= "number" then
+        start_value = 0
+    end
+    if type(end_value) ~= "number" then
+        end_value = start_value
+    end
+
+    local ratio_value = obj.getpoint("param")
+    if type(ratio_value) ~= "number" then
+        ratio_value = 0
+    end
+
+    -- soundsync_live_28が存在しない場合の対処
+    if type(soundsync_live_28) ~= "table" or type(soundsync_live_28.bar_height) ~= "number" then
+        return start_value
+    end
+
+    -- SoundSync_Live@DTMer Starter Kit から選択バーの高さを取得
+    local bar_height = soundsync_live_28.bar_height
+
+    if start_value == end_value then
+        return start_value
+    end
+
+    -- チェックOFF(生のtop_Y値)の場合はstart_valueへparam倍率を掛けて加算するだけ
+    if soundsync_live_28.use_ratio == false then
+        return start_value + bar_height * (ratio_value / 100)
+    end
+
+    -- 選択バーのクリップ比率(0～1、上限到達時のみ1)をparamでカーブ調整して補間係数にする
+    local clip_ratio = math.min(1, math.max(0, bar_height - 1))
+    local gamma = 100 / math.max(ratio_value, 1)
+    local sync_ratio = clip_ratio ^ gamma
+    local final_value = start_value + (end_value - start_value) * sync_ratio
+    return final_value
+end
+
+return audio_sync()
+
+
+@SoundSync_Cumulative
+--[[
+    音声同期です。
+    『SoundSync_Cumulative@DTMer Starter Kit』の値を利用して、トラックバーの値を音声同期させます。
+    param値で音声同期の強度を調整可能です。
+    トラックバーの終点値はどっち方向に増減するかを決めてる程度で、全然あてにならないのでparam値で調整してください。
+    最終フレームでトラックバーの終点値になっちゃうのはAviUtlの仕様です。どうにかする方法を知っていたら教えてください。
+]]
+--param:変化倍率,100
+--param:毎フレーム加算,1
+
+-- 音声同期(加算式)
+local function audio_sync()
+    local raw_index = obj.getpoint("index") or 0
+    local index = math.floor(raw_index)
+    local start_value = obj.getpoint(index)
+    local end_value = obj.getpoint(index + 1)
+    local ratio_value, add_value = obj.getpoint("param")
+    if type(start_value) ~= "number" then
+        start_value = 0
+    end
+    if type(end_value) ~= "number" then
+        end_value = start_value
+    end
+    if type(ratio_value) ~= "number" then
+        ratio_value = 0
+    end
+    if type(add_value) ~= "number" then
+        add_value = 0
+    end
+    -- soundsync_cumulative_28が存在しない場合の対処
+    if type(soundsync_cumulative_28) ~= "table" or type(soundsync_cumulative_28.bar_height) ~= "number" then
+        return start_value
+    end
+
+    -- soundsync_cumulative_28 から選択バーの高さを取得
+    local bar_height = soundsync_cumulative_28.bar_height
+
+    -- 音声同期の強さ
+    local value_direction = (end_value >= start_value) and 1 or -1
+    local sync_power = ratio_value * value_direction
+    local audio_boost
+    if soundsync_cumulative_28.use_ratio == false then
+        -- チェックOFF(生のtop_Y値の累積)の場合はそのまま倍率を掛ける
+        audio_boost = bar_height * sync_power
+    else
+        audio_boost = (bar_height - 1) * sync_power
+    end
+    local final_value = start_value + audio_boost + add_value
+
+    if start_value == end_value then
+        final_value = start_value
+    end
+    -- start_valueとend_valueの大小や符号を考慮してwrap
+    if end_value ~= start_value then
+        local min_value = math.min(start_value, end_value)
+        local max_value = math.max(start_value, end_value)
+        local value_range = max_value - min_value
+        if value_range > 0 then
+            if final_value > max_value then
+                final_value = min_value + ((final_value - max_value) % value_range)
+            elseif final_value < min_value then
+                final_value = max_value - ((min_value - final_value) % value_range)
+            end
+        end
+    end
+
+    return final_value
+end
+
+
+return audio_sync()
+
+@BPM_Sync
+--[[
+    BPM同期
+    BPMに合わせて値を変化させます。
+]]
+--param:BPM,128     -- BPM
+--param:拍数,4      -- 拍数
+--param:速度,1      -- 速度
+--param:遅れ,0      -- 遅らせる拍数
+--param:イージング,0    -- イージング番号 (0:飛び飛び, 1～100:イージング適用)
+
+local bpm, beat_numerator, beat_speed, beat_delay, easing_id = obj.getpoint("param")
+beat_delay = math.max(0, beat_delay or 0)
+easing_id = math.max(0, math.floor(easing_id or 0))
+
+local key_index = obj.getpoint("index")
+local value_start = obj.getpoint(key_index)
+local value_end = obj.getpoint(key_index + 1)
+local value_range = math.abs(value_end - value_start)
+local direction = (value_end >= value_start) and 1 or -1
+local beat_step = (beat_numerator > 1) and (value_range / (beat_numerator - 1)) or 0
+local beats_per_sec = bpm / 60 * beat_speed / 4
+local current_time = obj.getpoint("time")
+
+
+local function bpm_sync()
+    if current_time == 0 then
+        return value_start
+    end
+
+    local total_step = current_time * beat_numerator * beats_per_sec - beat_delay
+    if total_step <= 0 then
+        return value_start
+    end
+
+    if easing_id > 0 and _G.easing_eval_28 ~= nil then
+        local step_i = math.floor(total_step) % beat_numerator
+        local next_step_i = (step_i + 1) % beat_numerator
+        local frac = total_step - math.floor(total_step)
+        
+        local eased_frac = _G.easing_eval_28(easing_id, frac)
+        
+        local pos_i = step_i * beat_step
+        local pos_next = next_step_i * beat_step
+        local offset = pos_i + (pos_next - pos_i) * eased_frac
+        
+        return value_start + direction * offset
+    else
+        local current_beat = math.ceil(total_step)
+        local offset = ((current_beat - 1) % beat_numerator) * beat_step
+        return value_start + direction * offset
+    end
+end
+
+return bpm_sync()
+
+@MIDI_NoteTrigger
+--[[
+    MIDI_Receptor から値を取得して値へ変換します。
+    範囲は start_value から end_value までです。
+]]
+--param:MIDI番号,1
+
+local receptor_id = obj.getpoint("param")
+local midi_value = 0
+if _G.midi_eval_28 then
+    midi_value = _G.midi_eval_28(math.floor(receptor_id or 1), obj.getpoint("time") or 0)
+end
+
+local index = math.floor(obj.getpoint("index") or 0)
+local start_value = obj.getpoint(index)
+local end_value = obj.getpoint(index + 1)
+if type(start_value) ~= "number" then start_value = 0 end
+if type(end_value) ~= "number" then end_value = start_value end
+
+return start_value + (end_value - start_value) * midi_value
+
+
+@MIDI_Sync(Low)
+--[[
+    MIDI Receptor から最低音を取得して値へ変換します。
+    範囲は start_value から end_value までです。
+]]
+--param:MIDI番号,1
+
+local receptor_id = math.floor(obj.getpoint("param") or 1)
+local index = math.floor(obj.getpoint("index") or 0)
+local start_value = obj.getpoint(index)
+local end_value = obj.getpoint(index + 1)
+if type(start_value) ~= "number" then start_value = 0 end
+if type(end_value) ~= "number" then end_value = start_value end
+
+local receptor = _G.midi_receptors_28 and _G.midi_receptors_28[receptor_id]
+local notes = receptor and receptor.get_notes and receptor.get_notes("active") or {}
+local ratio = receptor and receptor.get_lowest_note and receptor.get_lowest_note(notes) or nil
+if ratio == nil then return start_value end
+return start_value + (end_value - start_value) * ratio
+
+
+@MIDI_Sync(High)
+--[[
+    MIDI Receptor から最高音を取得して値へ変換します。
+    範囲は start_value から end_value までです。
+]]
+--param:MIDI番号,1
+
+local receptor_id = math.floor(obj.getpoint("param") or 1)
+local index = math.floor(obj.getpoint("index") or 0)
+local start_value = obj.getpoint(index)
+local end_value = obj.getpoint(index + 1)
+if type(start_value) ~= "number" then start_value = 0 end
+if type(end_value) ~= "number" then end_value = start_value end
+
+local receptor = _G.midi_receptors_28 and _G.midi_receptors_28[receptor_id]
+local notes = receptor and receptor.get_notes and receptor.get_notes("active") or {}
+local ratio = receptor and receptor.get_highest_note and receptor.get_highest_note(notes) or nil
+if ratio == nil then return start_value end
+return start_value + (end_value - start_value) * ratio
